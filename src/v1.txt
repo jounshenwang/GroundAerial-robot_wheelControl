@@ -1,0 +1,152 @@
+// ===================== ESP32-S3 最终修正版 =====================
+#include <Arduino.h>
+#include <driver/ledc.h>
+
+// [引脚定义保持不变]
+#define PX4_AUX1_PIN    10 
+#define PX4_AUX2_PIN     9 
+#define PX4_CH9_PIN      8 
+#define ENC_L_A         15
+#define ENC_L_B         16
+#define ENC_R_A         38
+#define ENC_R_B         39
+#define STBY_PIN         7
+#define PWMA_PIN         4
+#define AIN1_PIN         6
+#define AIN2_PIN         5
+#define PWMD_PIN        37
+#define DIN1_PIN        35
+#define DIN2_PIN        36
+
+// [参数调整]
+#define DEAD_BAND_MIN    1420  // 略微扩大死区，增加容错
+#define DEAD_BAND_MAX    1580
+#define GROUND_MODE      1700
+#define MAX_SPEED        180
+
+// 全局 PID 状态结构体（为了方便统一清零）
+struct PID_State {
+    float integral = 0;
+    float last_err = 0;
+};
+PID_State pidL, pidR;
+
+volatile uint32_t ch3=1500, ch4=1500, ch5=1000;
+bool is_ground = false;
+volatile long count_l=0, count_r=0;
+
+// [PWM 读取增加基础限幅]
+void readCh3() { static uint32_t t=0; if(digitalRead(PX4_AUX1_PIN)) t=micros(); else ch3=constrain(micros()-t,1000,2000); }
+void readCh4() { static uint32_t t=0; if(digitalRead(PX4_AUX2_PIN)) t=micros(); else ch4=constrain(micros()-t,1000,2000); }
+void readCh5() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch5=constrain(micros()-t,1000,2000); }
+
+void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
+void IRAM_ATTR encR() { if(digitalRead(ENC_R_A) != digitalRead(ENC_R_B)) count_r++; else count_r--; }
+
+// ===================== 关键修改：带状态清除的停止 =====================
+void resetPID() {
+    pidL.integral = 0; pidL.last_err = 0;
+    pidR.integral = 0; pidR.last_err = 0;
+}
+
+void motorStop(){
+  digitalWrite(STBY_PIN, LOW);
+  digitalWrite(AIN1_PIN, LOW); digitalWrite(AIN2_PIN, LOW);
+  digitalWrite(DIN1_PIN, LOW); digitalWrite(DIN2_PIN, LOW);
+  ledcWrite(0, 0); ledcWrite(1, 0);
+  resetPID(); // 停止时必须清空 PID 记忆，否则切回来会暴冲
+}
+
+void motorLeft(int dir, uint8_t pwm){
+  digitalWrite(STBY_PIN, HIGH);
+  if(dir>0){ digitalWrite(AIN1_PIN,HIGH); digitalWrite(AIN2_PIN,LOW); }
+  else{ digitalWrite(AIN1_PIN,LOW); digitalWrite(AIN2_PIN,HIGH); }
+  ledcWrite(0,pwm);
+}
+
+void motorRight(int dir, uint8_t pwm){
+  if(dir>0){ digitalWrite(DIN1_PIN,HIGH); digitalWrite(DIN2_PIN,LOW); }
+  else{ digitalWrite(DIN1_PIN,LOW); digitalWrite(DIN2_PIN,HIGH); }
+  ledcWrite(1,pwm);
+}
+
+// ===================== 优化后的 PID 控制器 =====================
+int runPID(PID_State &s, int target, int actual, float Kp, float Ki, float Kd) {
+  if (target == 0) { s.integral = 0; s.last_err = 0; return 0; }
+  
+  float err = target - actual;
+  s.integral += err;
+  s.integral = constrain(s.integral, -150, 150); // 限制积分抗饱和
+  
+  float out = Kp * err + Ki * s.integral + Kd * (err - s.last_err);
+  s.last_err = err;
+  
+  return constrain((int)out, 0, 255);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(STBY_PIN,OUTPUT);
+  pinMode(AIN1_PIN,OUTPUT); pinMode(AIN2_PIN,OUTPUT);
+  pinMode(DIN1_PIN,OUTPUT); pinMode(DIN2_PIN,OUTPUT);
+  
+  ledcSetup(0,5000,8); // 提高频率到 5kHz 减少电机滋滋声
+  ledcSetup(1,5000,8);
+  ledcAttachPin(PWMA_PIN,0); ledcAttachPin(PWMD_PIN,1);
+
+  attachInterrupt(digitalPinToInterrupt(PX4_AUX1_PIN),readCh3,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PX4_AUX2_PIN),readCh4,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN),readCh5,CHANGE);
+
+  pinMode(ENC_L_A,INPUT); pinMode(ENC_L_B,INPUT);
+  pinMode(ENC_R_A,INPUT); pinMode(ENC_R_B,INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A),encL,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A),encR,CHANGE);
+
+  motorStop();
+}
+
+void loop() {
+  // 获取当前转速并清零计数
+  int actL = abs(count_l); count_l = 0;
+  int actR = abs(count_r); count_r = 0;
+
+  // 模式判定
+  is_ground = (ch5 > GROUND_MODE);
+
+  // ===================== 强化版逻辑控制 =====================
+  // 如果不是地面模式，或者油门在中位死区内
+  if(!is_ground || (ch3 > DEAD_BAND_MIN && ch3 < DEAD_BAND_MAX)) {
+    motorStop();
+  } 
+  else {
+    // 只有明确超过死区才计算速度
+    int base = 0;
+    if(ch3 >= DEAD_BAND_MAX) base = map(ch3, DEAD_BAND_MAX, 2000, 0, MAX_SPEED);
+    else if(ch3 <= DEAD_BAND_MIN) base = map(ch3, DEAD_BAND_MIN, 1000, 0, -MAX_SPEED);
+
+    // 转向逻辑
+    int steer = map(ch4, 1000, 2000, -60, 60);
+    // 增加转向死区，防止摇杆回中不准导致自转
+    if(ch4 > 1450 && ch4 < 1550) steer = 0; 
+
+    int targetL = constrain(base + steer, -MAX_SPEED, MAX_SPEED);
+    int targetR = constrain(base - steer, -MAX_SPEED, MAX_SPEED);
+
+    // 执行 PID
+    // 注意：这里的 Kp/Ki/Kd 使用你原来的参数
+    int pwm_l = runPID(pidL, abs(targetL), actL, 7.5, 1.0, 0.2);
+    int pwm_r = runPID(pidR, abs(targetR), actR, 7.5, 1.0, 0.2);
+    
+    motorLeft(targetL > 0 ? 1 : -1, pwm_l);
+    motorRight(targetR > 0 ? 1 : -1, pwm_r);
+  }
+
+  // 串口调试：观察切换模式时 ch3 是否真的稳定在 1500 左右
+  static uint32_t last_print = 0;
+  if(millis() - last_print > 100){
+    Serial.printf("Mode:%s CH3:%d L_Tar:%d R_Tar:%d\n", is_ground?"GND":"AIR", ch3, count_l, count_r);
+    last_print = millis();
+  }
+  delay(20); // 稍微加快循环频率
+}

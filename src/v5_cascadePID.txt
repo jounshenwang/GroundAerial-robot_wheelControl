@@ -1,0 +1,149 @@
+// ===================== ESP32-S3 陆空两栖机器人 串级PID位置增量版 =====================
+#include <Arduino.h>
+#include <driver/ledc.h>
+
+// [1. 引脚定义] - 保持不变
+#define PX4_CH3_PIN 10   // 油门 -> 控制位置增量速率
+#define PX4_CH4_PIN 9    // 偏航 -> 控制差速增量
+#define PX4_CH9_PIN 8    // 模式切换
+#define STBY_PIN 7
+#define PWMA_PIN 4
+#define AIN1_PIN 6
+#define AIN2_PIN 5
+#define PWMD_PIN 37
+#define DIN1_PIN 35
+#define DIN2_PIN 36
+#define ENC_L_A 15
+#define ENC_L_B 16
+#define ENC_R_A 38
+#define ENC_R_B 39
+
+// [2. 串级 PID 参数与结构体]
+struct CascadePID {
+    // 角度/位置外环 (P控制为主)
+    float kp_p = 1.2, ki_p = 0.01;
+    float p_integral = 0;
+    
+    // 速度内环 (PID控制)
+    float kp_v = 8.5, ki_v = 1.2, kd_v = 0.5;
+    float v_integral = 0, v_last_err = 0;
+};
+
+CascadePID pidL, pidR;
+
+// [3. 全局变量]
+volatile long count_l = 0, count_r = 0; // 编码器实时脉冲
+long targetPosL = 0, targetPosR = 0;    // 目标位置（胡萝卜）
+volatile uint32_t ch3=1500, ch4=1500, ch9=1000;
+
+#define MAX_V_TARGET 150   // 外环输出的最大速度限制 (内环的目标)
+#define ERROR_LIMIT 800    // 反暴冲限幅：目标位置领先当前位置的最大脉冲数
+
+// [4. 编码器与接收机中断] - 保持原有逻辑
+void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
+void IRAM_ATTR encR() { if(digitalRead(ENC_R_A) != digitalRead(ENC_R_B)) count_r++; else count_r--; }
+void readCh3() { static uint32_t t=0; if(digitalRead(PX4_CH3_PIN)) t=micros(); else ch3=constrain(micros()-t,1000,2000); }
+void readCh4() { static uint32_t t=0; if(digitalRead(PX4_CH4_PIN)) t=micros(); else ch4=constrain(micros()-t,1000,2000); }
+void readCh9() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch9=constrain(micros()-t,1000,2000); }
+
+// [5. 核心算法：串级 PID 计算]
+int computeCascade(CascadePID &p, long target, long actualPos, int actualSpeed) {
+    // --- 外环：位置环 ---
+    float p_err = target - actualPos;
+    p.p_integral = constrain(p.p_integral + p_err, -50, 50);
+    float v_target = p.kp_p * p_err + p.ki_p * p.p_integral;
+    v_target = constrain(v_target, -MAX_V_TARGET, MAX_V_TARGET); // 限制给内环的速度
+
+    // --- 内环：速度环 ---
+    float v_err = v_target - actualSpeed;
+    p.v_integral = constrain(p.v_integral + v_err, -150, 150);
+    float output = p.kp_v * v_err + p.ki_v * p.v_integral + p.kd_v * (v_err - p.v_last_err);
+    p.v_last_err = v_err;
+
+    return (int)constrain(output, -255, 255);
+}
+
+// [6. 电机驱动执行单元]
+void setMotor(int out, int p1, int p2, int channel) {
+    if (out > 5) { // 正向
+        digitalWrite(p1, HIGH); digitalWrite(p2, LOW);
+    } else if (out < -5) { // 反向
+        digitalWrite(p1, LOW); digitalWrite(p2, HIGH);
+    } else { // 主动制动 (驻车)
+        digitalWrite(p1, HIGH); digitalWrite(p2, HIGH);
+    }
+    ledcWrite(channel, constrain(abs(out), 0, 255));
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(STBY_PIN, OUTPUT); digitalWrite(STBY_PIN, HIGH);
+    pinMode(AIN1_PIN, OUTPUT); pinMode(AIN2_PIN, OUTPUT);
+    pinMode(DIN1_PIN, OUTPUT); pinMode(DIN2_PIN, OUTPUT);
+    
+    ledcSetup(0, 5000, 8); ledcSetup(1, 5000, 8);
+    ledcAttachPin(PWMA_PIN, 0); ledcAttachPin(PWMD_PIN, 1);
+
+    attachInterrupt(digitalPinToInterrupt(PX4_CH3_PIN), readCh3, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH4_PIN), readCh4, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN), readCh9, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), encL, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), encR, CHANGE);
+}
+
+void loop() {
+    static uint32_t lastSampleTime = 0;
+    if (millis() - lastSampleTime < 20) return; // 20ms 采样周期
+    lastSampleTime = millis();
+    
+    // A. 速度采样（每20ms采样一次脉冲差）
+    static long last_count_l = 0, last_count_r = 0;
+    int act_speed_l = count_l - last_count_l;
+    int act_speed_r = count_r - last_count_r;
+    last_count_l = count_l; last_count_r = count_r;
+
+    // B. 处理遥控器 -> 更新目标位置增量
+    if (ch9 > 1700) { // 仅在地面模式生效
+        // 1. 解析油门 (前后增量)
+        int move_step = 0;
+        if (ch3 > 1580 || ch3 < 1420) {
+            move_step = map(ch3, 1000, 2000, -60, 60); 
+        }
+        
+        // 2. 解析偏航 (差速增量)
+        int steer_step = 0;
+        if (ch4 > 1550 || ch4 < 1450) {
+            steer_step = map(ch4, 1000, 2000, -30, 30);
+        }
+
+        // 3. 应用增量到目标位置
+        targetPosL += (move_step + steer_step);
+        targetPosR += (move_step - steer_step);
+
+        // 4. 反暴冲限幅：目标不能领先实际位置太远
+        targetPosL = constrain(targetPosL, count_l - ERROR_LIMIT, count_l + ERROR_LIMIT);
+        targetPosR = constrain(targetPosR, count_r - ERROR_LIMIT, count_r + ERROR_LIMIT);
+
+        // 5. 计算并执行串级 PID
+        int outL = computeCascade(pidL, targetPosL, count_l, act_speed_l);
+        int outR = computeCascade(pidR, targetPosR, count_r, act_speed_r);
+
+        setMotor(outL, AIN1_PIN, AIN2_PIN, 0);
+        setMotor(outR, DIN1_PIN, DIN2_PIN, 1);
+    } 
+    else {
+        // 飞行模式：重置目标，释放电机
+        targetPosL = count_l; targetPosR = count_r;
+        setMotor(0, AIN1_PIN, AIN2_PIN, 0);
+        setMotor(0, DIN1_PIN, DIN2_PIN, 1);
+        pidL.p_integral = 0; pidL.v_integral = 0;
+        pidR.p_integral = 0; pidR.v_integral = 0;
+    }
+
+    // 串口调试：观察 target 追逐 count 的情况
+    static uint32_t t = 0;
+    if (millis() - t > 100) {
+        Serial.printf("Tar:%ld Cur:%ld Out:%d\n", targetPosL, count_l, act_speed_l);
+        t = millis();
+    }
+}

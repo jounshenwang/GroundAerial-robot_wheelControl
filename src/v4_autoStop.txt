@@ -1,0 +1,184 @@
+// ===================== ESP32-S3 陆空两栖光伏机器人终极版 =====================
+#include <Arduino.h>
+#include <driver/ledc.h>
+
+// [1. 接收机输入引脚]
+#define PX4_CH3_PIN     10  // AUX 1: 油门 (行驶)
+#define PX4_CH4_PIN      9  // AUX 2: 偏航 (转向)
+#define PX4_CH9_PIN      8  // AUX 3: 陆空模式切换
+#define PX4_CH10_PIN     3  // AUX 4: 额外电机独立开关 (C路)
+
+// [2. 行驶电机引脚 (A路 & D路)]
+#define STBY_PIN         7  
+#define PWMA_PIN         4  
+#define AIN1_PIN         6  
+#define AIN2_PIN         5  
+#define PWMD_PIN        37  
+#define DIN1_PIN        35  
+#define DIN2_PIN        36  
+
+// [3. 额外电机引脚 (C路 - 无须PID)]
+#define CIN1_PIN        40  
+#define CIN2_PIN        41  
+#define PWMC_PIN        42  
+
+// [4. 编码器引脚]
+#define ENC_L_A         15
+#define ENC_L_B         16
+#define ENC_R_A         38
+#define ENC_R_B         39
+
+// [5. 参数与阈值定义]
+#define DEAD_BAND_MIN    1420 
+#define DEAD_BAND_MAX    1580
+#define GROUND_MODE_VAL  1700 // CH9 超过此值进入地面模式
+#define EXTRA_ON_VAL     1500 // CH10 超过此值开启额外电机
+#define MAX_SPEED        180  // PID 目标速度上限
+
+struct PID_Data {
+    float integral = 0;
+    float last_err = 0;
+};
+PID_Data pidL, pidR;
+
+volatile uint32_t ch3=1500, ch4=1500, ch9=1000, ch10=1000;
+volatile long count_l=0, count_r=0;
+
+// [PWM信号中断读取]
+void readCh3() { static uint32_t t=0; if(digitalRead(PX4_CH3_PIN)) t=micros(); else ch3=constrain(micros()-t,1000,2000); }
+void readCh4() { static uint32_t t=0; if(digitalRead(PX4_CH4_PIN)) t=micros(); else ch4=constrain(micros()-t,1000,2000); }
+void readCh9() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch9=constrain(micros()-t,1000,2000); }
+void readCh10(){ static uint32_t t=0; if(digitalRead(PX4_CH10_PIN)) t=micros(); else ch10=constrain(micros()-t,1000,2000); }
+
+void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
+void IRAM_ATTR encR() { if(digitalRead(ENC_R_A) != digitalRead(ENC_R_B)) count_r++; else count_r--; }
+
+// ===================== 行驶控制函数 =====================
+
+// 停止行驶电机：包含主动驻车防溜坡逻辑
+void driveMotorsStop(bool activeBrake){
+    if(activeBrake) {
+        // 【防溜坡模式】IN1和IN2同时为HIGH，电机短路产生阻力
+        digitalWrite(AIN1_PIN, HIGH); digitalWrite(AIN2_PIN, HIGH);
+        digitalWrite(DIN1_PIN, HIGH); digitalWrite(DIN2_PIN, HIGH);
+        ledcWrite(0, 255); // 制动力设为最大
+        ledcWrite(1, 255);
+    } else {
+        // 【完全释放模式】用于空中，节省电能
+        digitalWrite(AIN1_PIN, LOW); digitalWrite(AIN2_PIN, LOW);
+        digitalWrite(DIN1_PIN, LOW); digitalWrite(DIN2_PIN, LOW);
+        ledcWrite(0, 0); ledcWrite(1, 0);
+    }
+    // 停止时清空PID状态，防止启动暴冲
+    pidL.integral = 0; pidL.last_err = 0;
+    pidR.integral = 0; pidR.last_err = 0;
+}
+
+// PID 核心算法
+int runPID(PID_Data &p, int target, int actual, float Kp, float Ki, float Kd){
+    if(target == 0) return 0;
+    float err = target - actual;
+    p.integral += err;
+    p.integral = constrain(p.integral, -150, 150);
+    float out = Kp * err + Ki * p.integral + Kd * (err - p.last_err);
+    p.last_err = err;
+    return constrain((int)out, 0, 255);
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    // 引脚模式初始化
+    pinMode(STBY_PIN, OUTPUT);
+    pinMode(AIN1_PIN, OUTPUT); pinMode(AIN2_PIN, OUTPUT);
+    pinMode(DIN1_PIN, OUTPUT); pinMode(DIN2_PIN, OUTPUT);
+    pinMode(CIN1_PIN, OUTPUT); pinMode(CIN2_PIN, OUTPUT);
+    pinMode(PWMC_PIN, OUTPUT);
+
+    // 行驶电机 PWM 通道配置
+    ledcSetup(0, 5000, 8); 
+    ledcSetup(1, 5000, 8);
+    ledcAttachPin(PWMA_PIN, 0); 
+    ledcAttachPin(PWMD_PIN, 1);
+
+    // 绑定接收机信号中断
+    attachInterrupt(digitalPinToInterrupt(PX4_CH3_PIN),  readCh3,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH4_PIN),  readCh4,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN),  readCh9,  CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH10_PIN), readCh10, CHANGE);
+
+    // 绑定编码器中断
+    pinMode(ENC_L_A, INPUT); pinMode(ENC_L_B, INPUT);
+    pinMode(ENC_R_A, INPUT); pinMode(ENC_R_B, INPUT);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), encL, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), encR, CHANGE);
+
+    digitalWrite(STBY_PIN, HIGH); // 驱动板总开关常开
+}
+
+void loop() {
+    // 获取当前编码器读数并清零
+    int actL = abs(count_l); count_l = 0;
+    int actR = abs(count_r); count_r = 0;
+
+    // --- 1. CH10 逻辑：额外电机独立控制 (C路) ---
+    // 与模式、油门均无关，纯粹由CH10开关控制
+    if (ch10 > EXTRA_ON_VAL) {
+        digitalWrite(CIN1_PIN, HIGH);
+        digitalWrite(CIN2_PIN, LOW);
+        digitalWrite(PWMC_PIN, HIGH); // 全速开启
+    } else {
+        digitalWrite(CIN1_PIN, LOW);
+        digitalWrite(CIN2_PIN, LOW);
+        digitalWrite(PWMC_PIN, LOW);
+    }
+
+    // --- 2. CH9 & 行驶逻辑：陆空切换与防溜坡 ---
+    bool is_ground = (ch9 > GROUND_MODE_VAL);
+
+    if (!is_ground) {
+        // 【飞行模式】完全关停行驶电机
+        driveMotorsStop(false); 
+    } 
+    else if (ch3 > DEAD_BAND_MIN && ch3 < DEAD_BAND_MAX) {
+        // 【地面模式+油门归中】开启主动驻车防溜坡
+        driveMotorsStop(true); 
+    }
+    else if (ch3 < 900) {
+        // 【异常/失联】安全驻车
+        driveMotorsStop(true);
+    }
+    else {
+        // 【地面模式+正常行驶】执行PID控制
+        int base = 0;
+        if(ch3 >= DEAD_BAND_MAX) base = map(ch3, DEAD_BAND_MAX, 2000, 0, MAX_SPEED);
+        else if(ch3 <= DEAD_BAND_MIN) base = map(ch3, DEAD_BAND_MIN, 1000, 0, -MAX_SPEED);
+
+        // 差速转向计算
+        int steer = (ch4 > 1550 || ch4 < 1450) ? map(ch4, 1000, 2000, -60, 60) : 0;
+
+        int targetL = constrain(base + steer, -MAX_SPEED, MAX_SPEED);
+        int targetR = constrain(base - steer, -MAX_SPEED, MAX_SPEED);
+
+        int pwm_l = runPID(pidL, abs(targetL), actL, 7.5, 1.0, 0.2);
+        int pwm_r = runPID(pidR, abs(targetR), actR, 7.5, 1.0, 0.2);
+        
+        // 左轮驱动 (A路)
+        if(targetL > 0){ digitalWrite(AIN1_PIN, HIGH); digitalWrite(AIN2_PIN, LOW); }
+        else { digitalWrite(AIN1_PIN, LOW); digitalWrite(AIN2_PIN, HIGH); }
+        ledcWrite(0, pwm_l);
+
+        // 右轮驱动 (D路)
+        if(targetR > 0){ digitalWrite(DIN1_PIN, HIGH); digitalWrite(DIN2_PIN, LOW); }
+        else { digitalWrite(DIN1_PIN, LOW); digitalWrite(DIN2_PIN, HIGH); }
+        ledcWrite(1, pwm_r);
+    }
+
+    // 串口调试监控
+    static uint32_t pTick = 0;
+    if(millis() - pTick > 100) {
+        Serial.printf("Mode:%s Extra:%d Thr:%d SpeedL:%d\n", is_ground?"GND":"AIR", ch10, ch3, actL);
+        pTick = millis();
+    }
+    delay(20); // 50Hz 控制频率
+}

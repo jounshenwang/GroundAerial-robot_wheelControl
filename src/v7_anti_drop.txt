@@ -1,0 +1,220 @@
+// ===================== ESP32-S3 陆空两栖机器人 V7 PRO (实战终极版) =====================
+#include <Arduino.h>
+#include <driver/ledc.h>
+#include <Wire.h>
+#include <VL53L1X.h>
+
+// ------------------- [1. 硬件引脚精确映射] -------------------
+// 接收机通道 (飞控/接收机输入)
+#define PX4_CH3_PIN  13   // 油门 (行走控制)
+#define PX4_CH4_PIN  12    // 偏航 (转向控制)
+#define PX4_CH9_PIN  11   // 模式切换 (低=飞行, 高=陆地)
+#define PX4_CH10_PIN 10   // 清洁电机物理开关
+#define PX4_CH11_PIN 9   // 地形自适应 (飞控 Pitch 角度映射)
+
+// 底盘电机驱动 (TB6612 / L298N)
+#define STBY_PIN 4
+#define PWMA_PIN 5
+#define AIN1_PIN 7
+#define AIN2_PIN 6
+#define PWMD_PIN 38
+#define DIN1_PIN 37
+#define DIN2_PIN 39
+
+// 清洁电机控制继电器/MOS
+#define CLEAN_MOTOR_PIN 47 
+
+// 霍尔编码器
+#define ENC_L_A 15
+#define ENC_L_B 16
+#define ENC_R_A 36
+#define ENC_R_B 35       
+
+// 防跌落 ToF 传感器阵列
+#define TOF_SDA_PIN    1  
+#define TOF_SCL_PIN    2  
+#define TOF_XSHUT_F   48  // 前传感器使能
+#define TOF_XSHUT_R   21  // 后传感器使能
+
+// ------------------- [2. 核心数据结构与全局变量] -------------------
+VL53L1X sensorF, sensorR;
+uint16_t distF = 0, distR = 0; // 缓存非阻塞距离数据
+
+struct CascadePID {
+    float kp_p = 1.2, ki_p = 0.01, p_integral = 0;
+    float kp_v = 8.5, ki_v = 1.2, kd_v = 0.5, v_integral = 0, v_last_err = 0;
+};
+CascadePID pidL, pidR;
+
+volatile long count_l = 0, count_r = 0; 
+long targetPosL = 0, targetPosR = 0;    
+volatile uint32_t ch3=1500, ch4=1500, ch9=1000, ch10=1000, ch11=1500;
+
+bool last_mode_ground = false; 
+float ff_fade_factor = 0;      
+
+#define ERROR_LIMIT 800     // 爆冲最大限制脉冲
+#define I_V_LIMIT 100       // 电机防烧积分限幅
+#define EDGE_DIST_MM 180    // 悬崖判定阈值(毫米)
+
+// ------------------- [3. 中断服务函数 (ISR)] -------------------
+void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
+void IRAM_ATTR encR() { if(digitalRead(ENC_R_A) != digitalRead(ENC_R_B)) count_r++; else count_r--; }
+
+// 脉宽精准捕获 (1000us - 2000us)
+void readCh3() { static uint32_t t=0; if(digitalRead(PX4_CH3_PIN)) t=micros(); else ch3=constrain(micros()-t,1000,2000); }
+void readCh4() { static uint32_t t=0; if(digitalRead(PX4_CH4_PIN)) t=micros(); else ch4=constrain(micros()-t,1000,2000); }
+void readCh9() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch9=constrain(micros()-t,1000,2000); }
+void readCh10(){ static uint32_t t=0; if(digitalRead(PX4_CH10_PIN)) t=micros(); else ch10=constrain(micros()-t,1000,2000); }
+void readCh11(){ static uint32_t t=0; if(digitalRead(PX4_CH11_PIN)) t=micros(); else ch11=constrain(micros()-t,1000,2000); }
+
+// ------------------- [4. 运动控制算法核心] -------------------
+int computeCascadeFF(CascadePID &p, long target, long actualPos, int actualSpeed, float max_v, float kp_v) {
+    // 位置外环
+    float p_err = target - actualPos;
+    p.p_integral = constrain(p.p_integral + p_err, -50, 50);
+    float v_target = constrain(p.kp_p * p_err + p.ki_p * p.p_integral, -max_v, max_v); 
+
+    // 速度内环
+    float v_err = v_target - actualSpeed;
+    p.v_integral = constrain(p.v_integral + v_err, -I_V_LIMIT, I_V_LIMIT);
+    float pid_output = kp_v * v_err + p.ki_v * p.v_integral + p.kd_v * (v_err - p.v_last_err);
+    p.v_last_err = v_err;
+
+    // 重力前馈补偿：映射 1000(下坡)-2000(上坡) 到 -45(刹车力)~+45(爬坡力)
+    float gravity_ff = map(ch11, 1000, 2000, -45, 45); 
+    float final_output = pid_output + (gravity_ff * ff_fade_factor);
+
+    return (int)constrain(final_output, -255, 255);
+}
+
+void setMotor(int out, int p1, int p2, int channel) {
+    if (out > 5) { digitalWrite(p1, HIGH); digitalWrite(p2, LOW); }
+    else if (out < -5) { digitalWrite(p1, LOW); digitalWrite(p2, HIGH); }
+    else { digitalWrite(p1, HIGH); digitalWrite(p2, HIGH); } // 电子刹车
+    ledcWrite(channel, constrain(abs(out), 0, 255));
+}
+
+// ------------------- [5. 系统初始化] -------------------
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(TOF_SDA_PIN, TOF_SCL_PIN);
+    Wire.setClock(400000); // 提升 I2C 速度到 400kHz，防止通信延迟
+
+    pinMode(CLEAN_MOTOR_PIN, OUTPUT); digitalWrite(CLEAN_MOTOR_PIN, LOW);
+
+    // ToF 并联分配地址序列
+    pinMode(TOF_XSHUT_F, OUTPUT); pinMode(TOF_XSHUT_R, OUTPUT);
+    digitalWrite(TOF_XSHUT_F, LOW); digitalWrite(TOF_XSHUT_R, LOW);
+    delay(10);
+    
+    // 初始化前传感器
+    digitalWrite(TOF_XSHUT_F, HIGH); delay(10);
+    if(sensorF.init()){ 
+        sensorF.setAddress(0x30); 
+        sensorF.setTimeout(100); // 增加防卡死超时保护
+        sensorF.startContinuous(33); // 33ms 采样率
+    }
+    
+    // 初始化后传感器
+    digitalWrite(TOF_XSHUT_R, HIGH); delay(10);
+    if(sensorR.init()){ 
+        sensorR.setAddress(0x31); 
+        sensorR.setTimeout(100);
+        sensorR.startContinuous(33); 
+    }
+
+    // 底盘驱动初始化
+    pinMode(STBY_PIN, OUTPUT); digitalWrite(STBY_PIN, HIGH);
+    pinMode(AIN1_PIN, OUTPUT); pinMode(AIN2_PIN, OUTPUT);
+    pinMode(DIN1_PIN, OUTPUT); pinMode(DIN2_PIN, OUTPUT);
+    ledcSetup(0, 5000, 8); ledcSetup(1, 5000, 8);
+    ledcAttachPin(PWMA_PIN, 0); ledcAttachPin(PWMD_PIN, 1);
+
+    // 绑定所有中断
+    attachInterrupt(digitalPinToInterrupt(PX4_CH3_PIN), readCh3, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH4_PIN), readCh4, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN), readCh9, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH10_PIN), readCh10, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH11_PIN), readCh11, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), encL, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), encR, CHANGE);
+}
+
+// ------------------- [6. 主控制循环 (50Hz)] -------------------
+void loop() {
+    // 强制 20ms 严格控制周期
+    static uint32_t lastSampleTime = 0;
+    if (millis() - lastSampleTime < 20) return;
+    lastSampleTime = millis();
+
+    // ================= [A. 独立外设控制] =================
+    // 清洁电机：CH10 高位开启，无视其他所有状态
+    if (ch10 > 1600) digitalWrite(CLEAN_MOTOR_PIN, HIGH);
+    else digitalWrite(CLEAN_MOTOR_PIN, LOW);
+
+    // 非阻塞获取边缘防跌落数据
+    if (sensorF.dataReady()) distF = sensorF.read();
+    if (sensorR.dataReady()) distR = sensorR.read();
+
+    // ================= [B. 陆空模式状态机] =================
+    bool current_mode_ground = (ch9 > 1700); 
+    if (current_mode_ground) {
+        
+        // 飞行 -> 陆地 的“软着陆”瞬间保护
+        if (!last_mode_ground) {
+            targetPosL = count_l; targetPosR = count_r;
+            pidL.p_integral = 0; pidL.v_integral = 0; 
+            pidR.p_integral = 0; pidR.v_integral = 0;
+            ff_fade_factor = 0;
+        }
+        
+        // 前馈淡入：1秒内平滑接管重力
+        if (ff_fade_factor < 1.0) ff_fade_factor += 0.02;
+
+        // --- 全向地形自适应 (上坡加力，下坡降速防冲) ---
+        // 计算坡度烈度：无论仰角俯角，偏离 1500 越多，系数越接近 1.0
+        float slope_factor = constrain(abs((int)ch11 - 1500) / 500.0, 0.0, 1.0);
+        float dynamic_max_v = 150 - (slope_factor * 80); // 坡越陡，极速越低，保证扭矩
+        float dynamic_kp_v = 8.5 + (slope_factor * 4.0); // 坡越陡，PID 抓地力越硬
+
+        // 速度反馈计算
+        static long last_count_l = 0, last_count_r = 0;
+        int act_speed_l = count_l - last_count_l;
+        int act_speed_r = count_r - last_count_r;
+        last_count_l = count_l; last_count_r = count_r;
+
+        // 遥控摇杆死区处理 (带有严格防下溢类型转换)
+        int move_step = 0, steer_step = 0;
+        if (ch3 > 900 && ch3 < 2100) {
+            if (abs((int)ch3 - 1500) > 80) move_step = map(ch3, 1000, 2000, -50, 50);
+            if (abs((int)ch4 - 1500) > 50) steer_step = map(ch4, 1000, 2000, -25, 25);
+        }
+
+        // --- ToF 防跌落拦截 (基于非阻塞数据) ---
+        if (move_step > 0 && distF > EDGE_DIST_MM) move_step = 0; // 悬崖停步
+        if (move_step < 0 && distR > EDGE_DIST_MM) move_step = 0;
+
+        // 目标位置更新与爆冲限幅
+        targetPosL += (move_step + steer_step);
+        targetPosR += (move_step - steer_step);
+        targetPosL = constrain(targetPosL, count_l - ERROR_LIMIT, count_l + ERROR_LIMIT);
+        targetPosR = constrain(targetPosR, count_r - ERROR_LIMIT, count_r + ERROR_LIMIT);
+
+        // 执行串级PID与输出
+        int outL = computeCascadeFF(pidL, targetPosL, count_l, act_speed_l, dynamic_max_v, dynamic_kp_v);
+        int outR = computeCascadeFF(pidR, targetPosR, count_r, act_speed_r, dynamic_max_v, dynamic_kp_v);
+
+        setMotor(outL, AIN1_PIN, AIN2_PIN, 0);
+        setMotor(outR, DIN1_PIN, DIN2_PIN, 1);
+        
+    } else {
+        // ================= [C. 飞行模式] =================
+        // 同步位置误差，开启全电磁刹车，等待飞行
+        targetPosL = count_l; targetPosR = count_r;
+        setMotor(0, AIN1_PIN, AIN2_PIN, 0);
+        setMotor(0, DIN1_PIN, DIN2_PIN, 1);
+        ff_fade_factor = 0; // 重置淡入
+    }
+    last_mode_ground = current_mode_ground;
+}
