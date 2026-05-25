@@ -1,16 +1,14 @@
-// ===================== ESP32-S3 陆空两栖机器人 V8 PRO (右手控制+防跌落终极版) =====================
+// ===================== ESP32-S3 陆空两栖机器人 V9.2 纯净无ToF版 =====================
 #include <Arduino.h>
 #include <driver/ledc.h>
-#include <Wire.h>
-#include <VL53L1X.h>
+#include <Wire.h> // 仅保留标准 I2C 库
 
 // ------------------- [1. 硬件引脚精确映射] -------------------
-// 接收机通道 (飞控/接收机输入，使用右手摇杆隔离飞行油门)
+// 接收机通道
 #define PX4_CH1_PIN  13   // 右手左右摇杆 (对应底盘转向)
 #define PX4_CH2_PIN  12   // 右手前后摇杆 (对应底盘前进/后退)
 #define PX4_CH9_PIN  11   // 模式切换开关 (低电平飞行，高电平陆地)
-#define PX4_CH10_PIN 10   // 清洁电机物理开关 (独立通道)
-#define PX4_PITCH_PIN 9    // 地形自适应数据 (飞控 Pitch 映射)
+#define PX4_CH10_PIN 10   // 清洁电机物理开关
 
 // 底盘电机驱动引脚
 #define STBY_PIN      4
@@ -30,24 +28,18 @@
 #define ENC_R_A      36
 #define ENC_R_B      35
 
-// 【修改点】：定义双独立总线引脚，不再使用地址切换
-#define TOF_SDA_F     8   
-#define TOF_SCL_F     3   
-#define TOF_SDA_R     17  
-#define TOF_SCL_R     18  
+// I2C 引脚定义（专用于 MPU6050）
+#define MPU_SDA_PIN   8   
+#define MPU_SCL_PIN   3   
+#define MPU6050_ADDR  0x68
 
 // ------------------- [2. 常量与控制参数] -------------------
 #define ERROR_LIMIT    800   // 位置环误差保护限幅 (单位：脉冲)
 #define I_V_LIMIT      100   // 速度环积分限幅
-#define EDGE_DIST_MM   180   // 悬崖/边缘判定距离 (毫米)
 #define CONTROL_PERIOD 20    // 控制周期 20ms (50Hz)
+#define DEBUG_PRINT_INTERVAL 1000 // 串口输出间隔 1000ms
 
 // ------------------- [3. 核心数据结构与全局变量] -------------------
-TwoWire i2cFront = TwoWire(0);
-TwoWire i2cRear = TwoWire(1);
-VL53L1X sensorF, sensorR;
-uint16_t distF = 0, distR = 0; // 缓存非阻塞距离数据
-
 // 串级 PID 结构体
 struct CascadePID {
     float kp_p = 1.2, ki_p = 0.01, p_integral = 0;
@@ -57,10 +49,23 @@ CascadePID pidL, pidR;
 
 volatile long count_l = 0, count_r = 0; 
 long targetPosL = 0, targetPosR = 0;    
-volatile uint32_t ch1=1500, ch2=1500, ch9=1000, ch10=1000, pitch=1500;
+volatile uint32_t ch1=1500, ch2=1500, ch9=1000, ch10=1000;
+volatile uint32_t pitch=1500; // 姿态前馈变量
 
+// 互补滤波姿态解算变量
+float angle_pitch = 0.0; 
+bool angle_initialized = false;
 bool last_mode_ground = false; 
-float ff_fade_factor = 0; // 模式切换时的动力淡入系数
+float ff_fade_factor = 0; 
+
+uint8_t readMPU6050WhoAmI() {
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x75);
+    if (Wire.endTransmission() != 0) return 0x00;
+    Wire.requestFrom(MPU6050_ADDR, (uint8_t)1);
+    if (Wire.available() < 1) return 0x00;
+    return Wire.read();
+}
 
 // ------------------- [4. 中断服务函数 (ISR)] -------------------
 void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
@@ -70,19 +75,6 @@ void readCh1() { static uint32_t t=0; if(digitalRead(PX4_CH1_PIN)) t=micros(); e
 void readCh2() { static uint32_t t=0; if(digitalRead(PX4_CH2_PIN)) t=micros(); else ch2=constrain(micros()-t,1000,2000); }
 void readCh9() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch9=constrain(micros()-t,1000,2000); }
 void readCh10(){ static uint32_t t=0; if(digitalRead(PX4_CH10_PIN)) t=micros(); else ch10=constrain(micros()-t,1000,2000); }
-void readPitch(){ static uint32_t t=0; if(digitalRead(PX4_PITCH_PIN)) t=micros(); else pitch=constrain(micros()-t,1000,2000); }
-
-void scanI2CBus(TwoWire &wire, const char *name) {
-    Serial.print("Scanning "); Serial.print(name); Serial.println(" I2C bus...");
-    for (uint8_t addr = 8; addr < 120; addr++) {
-        wire.beginTransmission(addr);
-        if (wire.endTransmission() == 0) {
-            Serial.print("  Found device at 0x");
-            if (addr < 16) Serial.print('0');
-            Serial.println(addr, HEX);
-        }
-    }
-}
 
 // ------------------- [5. 电机控制与 PID 算法] -------------------
 void setMotor(int out, int p1, int p2, int channel) {
@@ -93,7 +85,7 @@ void setMotor(int out, int p1, int p2, int channel) {
         digitalWrite(p1, LOW);
         digitalWrite(p2, HIGH);
     } else {
-        digitalWrite(p1, HIGH); // 电子刹车：双脚制动
+        digitalWrite(p1, HIGH); 
         digitalWrite(p2, HIGH);
     }
     ledcWrite(channel, constrain(abs(out), 0, 255));
@@ -109,6 +101,7 @@ int computeCascadeFF(CascadePID &p, long target, long actualPos, int actualSpeed
     float pid_output = kp_v * v_err + p.ki_v * p.v_integral + p.kd_v * (v_err - p.v_last_err);
     p.v_last_err = v_err;
 
+    // 地形自适应重力前馈
     float gravity_ff = map((int)pitch, 1000, 2000, -45, 45); 
     float final_output = pid_output + (gravity_ff * ff_fade_factor);
 
@@ -119,42 +112,29 @@ int computeCascadeFF(CascadePID &p, long target, long actualPos, int actualSpeed
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n======= V8 PRO START (DUAL-BUS) =======");
+    Serial.println("\n======= V9.2 START (ToF REMOVED, MPU6050 ONLY) =======");
 
-    // 【修改点】：初始化第一路 I2C (前)
-    i2cFront.begin(TOF_SDA_F, TOF_SCL_F, 400000);
-    i2cFront.setClock(400000);
-    sensorF.setBus(&i2cFront);
-    if (sensorF.init()) {
-        sensorF.setTimeout(500);
-        sensorF.startContinuous(50);
-        Serial.println("✓ VL53L1X Front OK (Pin 8/3)");
+    // 初始化标准 Wire I2C 总线，分配给 MPU6050
+    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 400000);
+    
+    // 唤醒 MPU6050
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x6B); // PWR_MGMT_1 寄存器
+    Wire.write(0);    // 写入 0 唤醒
+    if (Wire.endTransmission() == 0) {
+        uint8_t whoami = readMPU6050WhoAmI();
+        Serial.print("✓ MPU6050 Initialized, WHO_AM_I=0x");
+        Serial.println(whoami, HEX);
+        if (whoami != 0x68) {
+            Serial.println("✗ MPU6050 返回 WHO_AM_I 非 0x68，请检查模块地址或连接。");
+        }
     } else {
-        Serial.println("✗ Front Fail! Check wiring.");
+        Serial.println("✗ MPU6050 Connection FAILED! Please check wiring.");
     }
 
-    // 【修改点】：初始化第二路 I2C (后)
-    i2cRear.begin(TOF_SDA_R, TOF_SCL_R, 400000);
-    i2cRear.setClock(400000);
-    sensorR.setBus(&i2cRear);
-    if (sensorR.init()) {
-        sensorR.setTimeout(500);
-        sensorR.startContinuous(50);
-        Serial.println("✓ VL53L1X Rear OK (Pin 17/18)");
-    } else {
-        Serial.println("✗ Rear Fail! Check wiring.");
-    }
-
-    scanI2CBus(i2cFront, "Front");
-    scanI2CBus(i2cRear, "Rear");
-
+    // 初始化电机与驱动引脚
     pinMode(CLEAN_MOTOR_PIN, OUTPUT);
     digitalWrite(CLEAN_MOTOR_PIN, LOW);
-
-    // 【核心修复】：移除原代码中对 17, 18 的 pinMode(OUTPUT) 操作
-    // 这行注释保留，提醒不要恢复原代码的这部分内容
-    // pinMode(17, OUTPUT); digitalWrite(17, HIGH); <- 这会导致 Error -1
-
     pinMode(STBY_PIN, OUTPUT);
     digitalWrite(STBY_PIN, HIGH);
     pinMode(AIN1_PIN, OUTPUT);
@@ -167,11 +147,11 @@ void setup() {
     ledcAttachPin(PWMA_PIN, 0);
     ledcAttachPin(PWMD_PIN, 1);
 
+    // 绑定外部中断
     attachInterrupt(digitalPinToInterrupt(PX4_CH1_PIN), readCh1, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PX4_CH2_PIN), readCh2, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN), readCh9, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PX4_CH10_PIN), readCh10, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(PX4_PITCH_PIN), readPitch, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_L_A), encL, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_R_A), encR, CHANGE);
 }
@@ -182,14 +162,49 @@ void loop() {
     if (millis() - lastSampleTime < CONTROL_PERIOD) return;
     lastSampleTime = millis();
 
-    // 清洁电机控制 (原封不动)
+    // ================= [A. 独立外设控制与数据获取] =================
+    // 清洁电机开关
     if (ch10 > 1600) digitalWrite(CLEAN_MOTOR_PIN, HIGH);
     else digitalWrite(CLEAN_MOTOR_PIN, LOW);
 
-    // 获取测距数据 (非阻塞)
-    if (sensorF.dataReady()) distF = sensorF.read();
-    if (sensorR.dataReady()) distR = sensorR.read();
+    // 高速读取 MPU6050 原始数据
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x3B); // 加速度计 X 轴高位寄存器
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6050_ADDR, 14, true); 
+    
+    if (Wire.available() >= 14) {
+        int16_t ax = Wire.read() << 8 | Wire.read();
+        int16_t ay = Wire.read() << 8 | Wire.read();
+        int16_t az = Wire.read() << 8 | Wire.read();
+        Wire.read(); Wire.read(); // 跳过温度数据 (2字节)
+        int16_t gx = Wire.read() << 8 | Wire.read();
+        int16_t gy = Wire.read() << 8 | Wire.read();
+        int16_t gz = Wire.read() << 8 | Wire.read();
 
+        float accel_pitch = atan2((float)ay, sqrt((float)ax*ax + (float)az*az)) * 180.0 / PI;
+        float gyro_pitch_rate = (float)gy / 131.0; 
+
+        if (!angle_initialized) {
+            angle_pitch = accel_pitch;
+            angle_initialized = true;
+        }
+        angle_pitch = 0.98 * (angle_pitch + gyro_pitch_rate * 0.02) + 0.02 * accel_pitch;
+        pitch = constrain(1500 + (angle_pitch * (500.0 / 60.0)), 1000, 2000);
+
+        Serial.print("RAW ax="); Serial.print(ax);
+        Serial.print(" ay="); Serial.print(ay);
+        Serial.print(" az="); Serial.print(az);
+        Serial.print(" gy="); Serial.print(gy);
+        Serial.print(" gyro_pitch_rate="); Serial.print(gyro_pitch_rate, 2);
+        Serial.print(" accel_pitch="); Serial.print(accel_pitch, 2);
+        Serial.print(" angle_pitch="); Serial.print(angle_pitch, 2);
+        Serial.println();
+    } else {
+        Serial.println("✗ MPU6050 read failed: insufficient I2C data.");
+    }
+
+    // ================= [B. 陆地模式状态机] =================
     bool current_mode_ground = (ch9 > 1700);
 
     if (current_mode_ground) {
@@ -201,9 +216,9 @@ void loop() {
             ff_fade_factor = 0;
         }
         
-        if (ff_fade_factor < 1.0) ff_fade_factor += 0.02;
+        if (ff_fade_factor < 1.0) ff_fade_factor += 0.02; // 动力淡入
 
-        // 地形参数计算 (原封不动)
+        // 根据坡度自适应调整 PID 动态参数
         float slope_factor = constrain(abs((int)pitch - 1500) / 500.0, 0.0, 1.0);
         float dynamic_max_v = 150 - (slope_factor * 80); 
         float dynamic_kp_v = 8.5 + (slope_factor * 4.0); 
@@ -219,11 +234,8 @@ void loop() {
             if (abs((int)ch1 - 1500) > 50) steer_step = map((int)ch1, 1000, 2000, 25, -25); 
         }
 
-        // --- 【修改点】：边缘锁定逻辑 ---
-        if (distF > EDGE_DIST_MM && move_step > 0) move_step = 0; // 前方边缘锁死前进
-        if (distR > EDGE_DIST_MM && move_step < 0) move_step = 0; // 后方边缘锁死后退
 
-        // 位置控制逻辑 (原封不动)
+        // 位置累加与硬限幅保护
         targetPosL += (move_step + steer_step);
         targetPosR += (move_step - steer_step);
         targetPosL = constrain(targetPosL, count_l - ERROR_LIMIT, count_l + ERROR_LIMIT);
@@ -236,25 +248,25 @@ void loop() {
         setMotor(outR, DIN1_PIN, DIN2_PIN, 1);
 
     } else {
+        // ================= [C. 飞行模式] =================
         targetPosL = count_l;
         targetPosR = count_r;
         setMotor(0, AIN1_PIN, AIN2_PIN, 0);
         setMotor(0, DIN1_PIN, DIN2_PIN, 1);
-        ff_fade_factor = 0; 
+        ff_fade_factor = 0;
+        // 保留 angle_pitch 值，以便串口输出显示实际 MPU6050 角度
     }
 
     last_mode_ground = current_mode_ground;
 
-    // 串口监视器 (原封不动，包括所有的调试输出)
+    // ================= [D. 串口监视器] =================
     static uint32_t lastPrintTime = 0;
-    if (millis() - lastPrintTime > 500) {
-        Serial.print("[Pitch]"); Serial.print(pitch);
+    if (millis() - lastPrintTime > DEBUG_PRINT_INTERVAL) {
+        Serial.print("[Angle]"); Serial.print(angle_pitch, 1); 
+        Serial.print("° [MappedPitch]"); Serial.print(pitch);
         Serial.print(" [CH1]"); Serial.print(ch1);
         Serial.print(" [CH2]"); Serial.print(ch2);
-        Serial.print(" [Mode]"); Serial.print(current_mode_ground ? "Ground" : "Flight");
-        Serial.print(" [F]"); Serial.print(distF);
-        Serial.print("mm [R]"); Serial.print(distR);
-        Serial.println("mm");
+        Serial.print(" [Mode]"); Serial.println(current_mode_ground ? "Ground" : "Flight");
         lastPrintTime = millis();
     }
 }
