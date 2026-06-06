@@ -1,0 +1,325 @@
+// ===================== ESP32-S3 陆空两栖机器人 V10 =====================
+#include <Arduino.h>
+#include <driver/ledc.h>
+#include <Wire.h> 
+
+// ------------------- [1. 硬件引脚精确映射] -------------------
+// 接收机通道
+#define PX4_CH1_PIN  13   // 右手左右摇杆 (对应底盘转向)
+#define PX4_CH2_PIN  12   // 右手前后摇杆 (对应底盘前进/后退)
+#define PX4_CH9_PIN  11   // 模式切换开关 (低电平飞行，高电平陆地)
+#define PX4_CH10_PIN 10   // 清洁电机物理开关
+
+// 底盘电机驱动引脚
+#define STBY_PIN      4
+#define PWMA_PIN      5
+#define AIN1_PIN      7
+#define AIN2_PIN      6
+#define PWMD_PIN      38
+#define DIN1_PIN      37
+#define DIN2_PIN      39
+
+// 清洁电机控制引脚
+#define CLEAN_MOTOR_PIN 47 
+
+// 霍尔编码器引脚
+#define ENC_L_A      15
+#define ENC_L_B      16
+#define ENC_R_A      36
+#define ENC_R_B      35
+
+// I2C MPU6050引脚定义
+#define MPU_SDA_PIN   8   
+#define MPU_SCL_PIN   3   
+#define MPU6050_ADDR  0x68
+
+// ------------------- [2. 常量与控制参数] -------------------
+#define ERROR_LIMIT    800   // 位置环误差保护限幅 (单位：脉冲)
+#define I_V_LIMIT      100   // 速度环积分限幅
+#define CONTROL_PERIOD 20    // 控制周期 20ms (50Hz)
+#define DEBUG_PRINT_INTERVAL 500 // 串口输出间隔 500ms
+// 编码器与速度换算常量
+#define ENCODER_PPR 13
+#define GEAR_RATIO 34
+#define ENCODER_MULT 4 // 计数倍频，为 4 倍频
+// 使用电机额定转速作为速度上限（RPM）
+#define MAX_RPM 250.0f
+// 在陡坡时保留的最小速比（与原代码 70/150 保持一致）
+#define MIN_RPM_FACTOR 0.46666667f
+
+// ------------------- [3. 核心数据结构与全局变量] -------------------
+// 串级 PID 结构体
+struct CascadePID {
+    float kp_p = 1.2, ki_p = 0.01, p_integral = 0; // 位置环参数与积分
+    float kp_v = 8.5, ki_v = 1.2, kd_v = 0.5, v_integral = 0, v_last_err = 0; // 速度环参数与积分
+};
+CascadePID pidL, pidR;// 左右电机 PID 实例
+
+volatile long count_l = 0, count_r = 0; // 编码器计数
+long targetPosL = 0, targetPosR = 0; // 目标位置（单位：编码器脉冲）   
+volatile uint32_t ch1=1500, ch2=1500, ch9=1000, ch10=1000; // 接收机通道值 (初始为中立位置 1500us，模式开关为飞行模式 1000us)
+volatile uint32_t pitch=1500; // 姿态前馈变量
+
+// 互补滤波姿态解算变量
+float angle_pitch = 0.0; // 机器人当前俯仰角度 (单位：度)
+bool angle_initialized = false; // 是否完成初始角度设定
+bool last_mode_ground = false; // 上一周期是否处于陆地模式
+float ff_fade_factor = 0; // 前馈淡入因子，范围 0-1，根据陆地模式持续时间增加
+
+// 读取 MPU6050 WHO_AM_I 寄存器，验证连接
+uint8_t readMPU6050WhoAmI() {
+    Wire.beginTransmission(MPU6050_ADDR); // 向 MPU6050 发送起始信号
+    Wire.write(0x75); // WHO_AM_I 寄存器地址
+    if (Wire.endTransmission() != 0) return 0x00; // 发送失败返回 0x00
+    Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1); // 请求 1 字节数据
+    if (Wire.available() < 1) return 0x00; // 无数据可读返回 0x00
+    return Wire.read(); // 返回 WHO_AM_I 寄存器值，正常应为 0x68
+}
+
+// ------------------- [4. 中断服务函数 (ISR)] -------------------
+// 编码器 A 相变化时更新计数，判断方向,A和B不相等则正向计数，否则反向计数
+void IRAM_ATTR encL() { if(digitalRead(ENC_L_A) != digitalRead(ENC_L_B)) count_l++; else count_l--; }
+void IRAM_ATTR encR() { if(digitalRead(ENC_R_A) != digitalRead(ENC_R_B)) count_r++; else count_r--; }
+
+// 接收机通道变化时测量高电平持续时间，转换为 1000-2000 范围内的 PWM 值，time = 0 时表示通道为低电平，time > 0 时表示通道为高电平，time 的值即为高电平持续的微秒数
+void readCh1() { static uint32_t t=0; if(digitalRead(PX4_CH1_PIN)) t=micros(); else ch1=constrain(micros()-t,1000,2000); }
+void readCh2() { static uint32_t t=0; if(digitalRead(PX4_CH2_PIN)) t=micros(); else ch2=constrain(micros()-t,1000,2000); }
+void readCh9() { static uint32_t t=0; if(digitalRead(PX4_CH9_PIN)) t=micros(); else ch9=constrain(micros()-t,1000,2000); }
+void readCh10(){ static uint32_t t=0; if(digitalRead(PX4_CH10_PIN)) t=micros(); else ch10=constrain(micros()-t,1000,2000); }
+
+// ------------------- [5. 电机控制与 PID 算法] -------------------
+void setMotor(int out, int p1, int p2, int channel) { // out 范围 -255~255，channel 0 左电机，1 右电机
+    if (out > 5) { // 正向输出，p1 高电平，p2 低电平
+        digitalWrite(p1, HIGH);
+        digitalWrite(p2, LOW);
+    } else if (out < -5) { // 反向输出，p1 低电平，p2 高电平
+        digitalWrite(p1, LOW);
+        digitalWrite(p2, HIGH);
+    } else { // 停止输出，p1 和 p2 都设为高电平以进入刹车状态
+        digitalWrite(p1, HIGH); 
+        digitalWrite(p2, HIGH);
+    }
+    ledcWrite(channel, constrain(abs(out), 0, 255)); // 设置 PWM 占空比，使用绝对值，因为方向由 p1 和 p2 的电平决定
+}
+
+// 驱动电机停止，activeBrake 为 true 时进入防溜坡模式，activeBrake 为 false 时完全释放
+void driveMotorsStop(bool activeBrake) {
+    if (activeBrake) {
+        // 【防溜坡模式】IN1和IN2同时为HIGH，电机短路产生阻力
+        digitalWrite(AIN1_PIN, HIGH); digitalWrite(AIN2_PIN, HIGH);
+        digitalWrite(DIN1_PIN, HIGH); digitalWrite(DIN2_PIN, HIGH);
+        ledcWrite(0, 255); // 制动力设为最大
+        ledcWrite(1, 255);
+    } else {
+        // 【完全释放模式】用于空中，节省电能
+        digitalWrite(AIN1_PIN, LOW); digitalWrite(AIN2_PIN, LOW);
+        digitalWrite(DIN1_PIN, LOW); digitalWrite(DIN2_PIN, LOW);
+        ledcWrite(0, 0); ledcWrite(1, 0);
+    }
+    pidL.p_integral = 0; pidL.v_integral = 0; pidL.v_last_err = 0;
+    pidR.p_integral = 0; pidR.v_integral = 0; pidR.v_last_err = 0;
+}
+
+// 计算串级 PID 输出，包含前馈补偿
+int computeCascadeFF(CascadePID &p, long target, long actualPos, int actualSpeed, float max_v, float kp_v) {
+    float p_err = (float)(target - actualPos); // 位置误差
+    p.p_integral = constrain(p.p_integral + p_err, -50, 50); // 位置积分限幅，防止过大
+    float v_target = constrain(p.kp_p * p_err + p.ki_p * p.p_integral, -max_v, max_v); // 位置环输出作为速度目标，限幅保护
+    float v_err = v_target - (float)actualSpeed; // 速度误差
+
+    //【硬件堵转过载保护】：当速度误差过大且目标速度不为零时，认为可能发生堵转，此时不增加积分以避免积分无限增大烧毁电机，同时输出一个适度的控制信号尝试克服堵转
+    p.v_integral = constrain(p.v_integral + v_err, -I_V_LIMIT, I_V_LIMIT); // 速度积分限幅，防止过大
+    float pid_output = kp_v * v_err + p.ki_v * p.v_integral + p.kd_v * (v_err - p.v_last_err); // 速度环 PID 输出
+    p.v_last_err = v_err; // 更新速度误差历史值
+
+    // 地形自适应重力前馈
+    float gravity_ff = map((int)pitch, 1000, 2000, -45, 45); // 将 pitch 映射到 -45° 到 45°，对应较大坡度时提供更强的前馈补偿
+    float final_output = pid_output + (gravity_ff * ff_fade_factor); // 根据当前坡度和淡入因子调整前馈补偿，确保在刚切换到陆地模式时不会有过大冲击，随着持续时间增加逐渐提供全额补偿
+
+    return (int)constrain(final_output, -255, 255);// 最终输出限幅到电机控制范围
+}
+
+// ------------------- [6. 系统初始化 setup] -------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n======= V10 START =======");
+
+    // 初始化标准 Wire I2C 总线，分配给 MPU6050
+    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 400000);// 使用 400kHz 的高速模式初始化 I2C 总线，以满足 MPU6050 的快速数据读取需求
+    
+    // 唤醒 MPU6050
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x6B); // PWR_MGMT_1 寄存器
+    Wire.write(0);    // 写入 0 唤醒
+    if (Wire.endTransmission() == 0) {// 成功唤醒后读取 WHO_AM_I 寄存器验证连接
+        uint8_t whoami = readMPU6050WhoAmI();// 输出 WHO_AM_I 寄存器值，正常应为 0x68
+        Serial.print("✓ MPU6050 Initialized, WHO_AM_I=0x");
+        Serial.println(whoami, HEX);// 验证 WHO_AM_I 寄存器值是否正确
+        if (whoami != 0x68) {
+            Serial.println("✗ MPU6050 返回 WHO_AM_I 非 0x68，请检查模块地址或连接。");
+        }
+    } else {// 唤醒失败
+        Serial.println("✗ MPU6050 Connection FAILED! Please check wiring.");
+    }
+
+    // 初始化电机与驱动引脚
+    pinMode(CLEAN_MOTOR_PIN, OUTPUT);
+    digitalWrite(CLEAN_MOTOR_PIN, LOW);
+    pinMode(STBY_PIN, OUTPUT);
+    digitalWrite(STBY_PIN, HIGH);
+    pinMode(AIN1_PIN, OUTPUT);
+    pinMode(AIN2_PIN, OUTPUT);
+    pinMode(DIN1_PIN, OUTPUT);
+    pinMode(DIN2_PIN, OUTPUT);
+
+    ledcSetup(0, 5000, 8);// 配置 LEDC 定时器 0，频率 5kHz，分辨率 8 位
+    ledcSetup(1, 5000, 8);// 配置 LEDC 定时器 1，频率 5kHz，分辨率 8 位
+    ledcAttachPin(PWMA_PIN, 0);// 将 PWMA_PIN 连接到 LEDC 定时器 0，控制左电机速度
+    ledcAttachPin(PWMD_PIN, 1);// 将 PWMD_PIN 连接到 LEDC 定时器 1，控制右电机速度
+
+    // 绑定外部中断
+    attachInterrupt(digitalPinToInterrupt(PX4_CH1_PIN), readCh1, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH2_PIN), readCh2, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH9_PIN), readCh9, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PX4_CH10_PIN), readCh10, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), encL, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_B), encL, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), encR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_B), encR, CHANGE);
+}
+
+// ------------------- [7. 主控制循环] -------------------
+void loop() {
+    static uint32_t lastSampleTime = 0;// 控制周期计时，确保每 20ms 执行一次控制逻辑
+    static uint32_t lastPrintTime = 0;// 串口输出计时，确保每 500ms 输出一次调试信息
+    if (millis() - lastSampleTime < CONTROL_PERIOD) return;// 如果距离上次采样时间不足 CONTROL_PERIOD，则跳过本次循环，等待下一个周期
+    lastSampleTime = millis(); // 更新采样时间戳
+
+    // ================= [A. 独立外设控制与数据获取] =================
+    // 清洁电机开关
+    if (ch10 > 1600) digitalWrite(CLEAN_MOTOR_PIN, HIGH);
+    else digitalWrite(CLEAN_MOTOR_PIN, LOW);
+
+    // 高速读取 MPU6050 原始数据
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x3B); // 加速度计 X 轴高位寄存器
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)MPU6050_ADDR, (size_t)14, true); 
+    
+    if (Wire.available() >= 14) {// 确保有足够数据可读，MPU6050 的加速度计和陀螺仪数据共 14 字节
+        int16_t ax = Wire.read() << 8 | Wire.read();
+        int16_t ay = Wire.read() << 8 | Wire.read();
+        int16_t az = Wire.read() << 8 | Wire.read();
+        Wire.read(); Wire.read(); // 跳过温度数据 (2字节)
+        int16_t gx = Wire.read() << 8 | Wire.read();
+        int16_t gy = Wire.read() << 8 | Wire.read();
+        int16_t gz = Wire.read() << 8 | Wire.read();
+
+        // 互补滤波姿态解算，计算当前俯仰角度，并根据陀螺仪数据更新角度估计，
+        // 融合加速度计和陀螺仪数据以获得更稳定的姿态估计，最终将俯仰角度映射到 1000-2000 范围内作为前馈补偿输入
+        float accel_pitch = atan2((float)ay, sqrt((float)ax*ax + (float)az*az)) * 180.0 / PI;
+        float gyro_pitch_rate = (float)gy / 131.0; // 将陀螺仪原始值转换为度/秒，MPU6050 的陀螺仪默认量程为 ±250°/s，对应 131 LSB/(°/s)
+
+        // 角度初始化与互补滤波融合
+        if (!angle_initialized) {
+            angle_pitch = accel_pitch;// 初始角度设定为加速度计计算的俯仰角，确保系统启动时有一个合理的姿态估计值
+            angle_initialized = true;// 完成初始角度设定后，进入正常的互补滤波更新流程
+        }
+        // 互补滤波融合：陀螺仪积分更新角度估计，加速度计提供长期稳定的参考，融合系数 0.98/0.02 以平衡短期响应和长期稳定性
+        angle_pitch = 0.98 * (angle_pitch + gyro_pitch_rate * 0.02) + 0.02 * accel_pitch;
+        // 将当前俯仰角度映射到 1000-2000 范围内，1500 对应水平，1000 对应向下 90°，2000 对应向上 90°，为前馈补偿提供输入
+        pitch = constrain(1500 + (angle_pitch * (500.0 / 60.0)), 1000, 2000);
+
+        // 调试输出 MPU6050 原始数据和计算的角度信息，每 500ms 输出一次，帮助监视传感器数据和姿态解算结果，验证系统状态
+        if (millis() - lastPrintTime > DEBUG_PRINT_INTERVAL) {//
+            Serial.print("RAW ax="); Serial.print(ax);// 输出原始加速度计 X 轴数据
+            Serial.print(" ay="); Serial.print(ay);// 输出原始加速度计 Y 轴数据
+            Serial.print(" az="); Serial.print(az);// 输出原始加速度计 Z 轴数据
+            Serial.print(" gy="); Serial.print(gy);// 输出原始陀螺仪 Y 轴数据
+            Serial.print(" gyro_pitch_rate="); Serial.print(gyro_pitch_rate, 2);// 输出计算的陀螺仪俯仰角速度，保留两位小数
+            Serial.print(" accel_pitch="); Serial.print(accel_pitch, 2);// 输出计算的加速度计俯仰角度，保留两位小数
+            Serial.print(" angle_pitch="); Serial.print(angle_pitch, 2);// 输出融合后的当前俯仰角度，保留两位小数
+            Serial.println();
+        }
+    } else {
+        Serial.println("✗ MPU6050 read failed: insufficient I2C data.");
+    }
+
+    // ================= [B. 陆地模式状态机] =================
+    bool current_mode_ground = (ch9 > 1700);// 根据接收机通道 9 的值判断当前是否处于陆地模式，ch9 > 1700 表示切换到陆地模式，ch9 <= 1700 表示飞行模式
+
+    if (current_mode_ground) {
+        // 刚切换到陆地模式时，重置 PID 目标位置和积分项，避免由于飞行模式下的姿态变化导致的突发大误差引起的过度补偿，
+        //同时启动前馈淡入机制，逐渐增加前馈补偿以适应地形坡度，确保平稳过渡到陆地控制状态
+        if (!last_mode_ground) {
+            targetPosL = count_l;
+            targetPosR = count_r;
+            pidL.p_integral = 0; pidL.v_integral = 0;
+            pidR.p_integral = 0; pidR.v_integral = 0;
+            ff_fade_factor = 0;
+        }
+        
+        if (ff_fade_factor < 1.0) ff_fade_factor += 0.02; // 动力淡入
+
+        // 根据坡度自适应调整 PID 动态参数
+        float slope_factor = constrain(abs((int)pitch - 1500) / 500.0, 0.0, 1.0);//得到的角度值减去1500后取绝对值，除以500得到一个0到1之间的坡度因子，表示当前地形的陡峭程度
+        // 根据 4 倍频编码器与额定转速计算每周期允许的脉冲上限（单位：脉冲 / CONTROL_PERIOD）
+        float counts_per_rev = (float)(ENCODER_PPR * ENCODER_MULT * GEAR_RATIO);
+        float max_counts_per_sec = (MAX_RPM / 60.0f) * counts_per_rev;
+        float max_counts_per_period = max_counts_per_sec * (CONTROL_PERIOD / 1000.0f); // CONTROL_PERIOD 单位 ms
+        // 在坡度变化时，按原代码的比例把最大值从 baseline 降到约 46.67%（即 70/150）
+        float dynamic_max_v = max_counts_per_period - (slope_factor * (max_counts_per_period * (1.0f - MIN_RPM_FACTOR)));
+        float dynamic_kp_v = 8.5 + (slope_factor * 4.0);// 根据坡度因子动态调整速度环的 KP 参数，增加最大 4.0 的增益，以在陡坡时提供更积极的速度响应，帮助克服重力影响
+
+        static long last_count_l = 0, last_count_r = 0;// 计算实际速度（单位：脉冲 / CONTROL_PERIOD），通过当前计数与上次计数的差值来估算，提供给速度环 PID 使用
+        int act_speed_l = (int)(count_l - last_count_l);// 计算左电机实际速度，单位为编码器脉冲数每 CONTROL_PERIOD，正值表示前进，负值表示后退
+        int act_speed_r = (int)(count_r - last_count_r);//右边
+        last_count_l = count_l; last_count_r = count_r;// 更新上次计数值，为下一周期的速度计算做准备
+
+        int move_step = 0, steer_step = 0;// 根据接收机通道 1 和通道 2 的值计算移动步长和转向步长，ch2 控制前进/后退，ch1 控制转向，只有当通道值明显偏离中立位置时才进行控制，以避免死区内的微小抖动引起不必要的响应
+
+        // 【保护：链路安全检测】
+        // 只有当信号在正常脉宽范围内(900~2100us)才允许移动，否则 move_step 为 0（驻车）
+        if (ch2 > 900 && ch2 < 2100) {
+            if (abs((int)ch2 - 1500) > 80) move_step = map((int)ch2, 1000, 2000, -50, 50);// 将 ch2 映射到 -50 到 50 的移动步长，1000 对应 -50（全速后退），2000 对应 50（全速前进），1500 对应 0（停止）
+            if (abs((int)ch1 - 1500) > 50) steer_step = map((int)ch1, 1000, 2000, 25, -25); 
+        }
+
+
+        // 【针对“控制算法”的失控保护】：位置累加与硬限幅保护
+        // 根据移动步长和转向步长计算目标位置的增量，move_step 直接影响前进/后退，steer_step 根据左右摇杆的偏移调整左右电机的目标位置以实现转向，左电机增加 steer_step，右电机减少 steer_step，以实现差速转向
+        targetPosL += (move_step + steer_step);
+        targetPosR += (move_step - steer_step);
+        targetPosL = constrain(targetPosL, count_l - ERROR_LIMIT, count_l + ERROR_LIMIT);// 对目标位置进行限幅，确保它不会偏离当前计数过远，防止由于突发大误差引起的过度补偿，ERROR_LIMIT 定义了允许的最大误差范围，单位为编码器脉冲数
+        targetPosR = constrain(targetPosR, count_r - ERROR_LIMIT, count_r + ERROR_LIMIT);
+
+        // 计算串级 PID 输出，包含前馈补偿，根据当前目标位置、实际位置和实际速度计算电机控制输出
+        int outL = computeCascadeFF(pidL, targetPosL, count_l, act_speed_l, dynamic_max_v, dynamic_kp_v);
+        int outR = computeCascadeFF(pidR, targetPosR, count_r, act_speed_r, dynamic_max_v, dynamic_kp_v);
+
+        // 设置电机输出，根据计算的 PID 输出控制左右电机的速度和方向，setMotor 函数会根据输出值的正负设置电机的转向，并通过 LEDC 定时器控制 PWM 占空比实现速度调节
+        setMotor(outL, AIN1_PIN, AIN2_PIN, 0);
+        setMotor(outR, DIN1_PIN, DIN2_PIN, 1);
+
+    } else {
+        // ================= [C. 飞行模式] =================
+        //【针对“模式切换”的初始位错保护】：防止机器人在落地瞬间因为之前残留的目标位置数据而产生不可预期的剧烈跳动
+        targetPosL = count_l;// 切换到飞行模式时，重置目标位置为当前计数，确保飞行模式下的控制从当前位置开始，避免由于位置误差引起的突发响应，同时保持前馈淡入因子为 0，确保在飞行模式下不受地形坡度影响
+        targetPosR = count_r;
+        driveMotorsStop(false);// 飞行模式下完全释放电机，节省电能，同时清空 PID 状态，准备下一次切换到陆地模式时有一个干净的状态，避免由于飞行模式下的姿态变化导致的突发大误差引起的过度补偿
+        ff_fade_factor = 0;
+    }
+
+    last_mode_ground = current_mode_ground;// 更新上一周期的模式状态，为下一周期的模式切换检测做准备
+
+    // ================= [D. 串口监视器] =================
+    if (millis() - lastPrintTime > DEBUG_PRINT_INTERVAL) {
+        Serial.print("[Angle]"); Serial.print(angle_pitch, 1); 
+        Serial.print("° [MappedPitch]"); Serial.print(pitch);
+        Serial.print(" [CH1]"); Serial.print(ch1);
+        Serial.print(" [CH2]"); Serial.print(ch2);
+        Serial.print(" [Mode]"); Serial.println(current_mode_ground ? "Ground" : "Flight");
+        lastPrintTime = millis();
+    }
+}
