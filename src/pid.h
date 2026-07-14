@@ -46,6 +46,27 @@ struct CascadePID {
      */
     int compute(long target, long actualPos, int actualSpeed,
                 float maxV, float kpV, float feedForward);
+
+    /**
+     * @brief 纯速度环计算（跳过位置外环，直接给定速度目标）
+     *
+     * 用于 ROS2 自主导航模式。
+     * 在此模式下，位置控制由 Orin Nano 上的 Nav2 负责（代价地图 + 行为树），
+     * ESP32 仅作为速度执行器：接收速度指令 → 速度环 PID → PWM 输出。
+     *
+     * 速度环结构与 compute() 的内环完全相同，包括：
+     *   - 微分先行 (Derivative on Measurement)
+     *   - 条件积分抗饱和 (Conditional Integration Anti-Windup)
+     *   - 重力前馈叠加
+     *
+     * @param vTarget     目标速度 (编码器脉冲/控制周期, 由 Orin Nano 下发)
+     * @param actualSpeed 当前实际速度
+     * @param kpV         速度环比例增益 (来自坡度自适应)
+     * @param feedForward 重力前馈补偿值
+     * @return int        电机 PWM 输出 (-255 ~ 255)
+     */
+    int computeVelocity(int vTarget, int actualSpeed,
+                        float kpV, float feedForward);
 };
 
 // 全局左右 PID 实例

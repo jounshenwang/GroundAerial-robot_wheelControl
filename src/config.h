@@ -88,7 +88,29 @@
 #define ENCODER_MULT  4      // 计数倍频 (4倍频)
 #define MAX_RPM       250.0f // 电机额定转速 (RPM)
 
-// ------------------- [4. 自主"弓"字形清扫核心参数] -------------------
+// ------------------- [4. 串口通信（ESP32 ↔ Orin Nano UART1）] -------------------
+// 物理引脚
+#define COMM_RX_PIN      44     // UART1 RX (接 Orin Nano TX, Pin 8)
+#define COMM_TX_PIN      43     // UART1 TX (接 Orin Nano RX, Pin 10)
+#define COMM_BAUD        921600 // 波特率 (7+15 字节/帧, ~190µs 传输时间)
+
+// 通信帧参数
+#define COMM_FRAME_PERIOD    20   // 收发周期 20ms (50Hz, 与控制周期同步)
+#define COMM_SYNC_DOWN    0xAA   // 下行帧头 (ROS2 → ESP32)
+#define COMM_SYNC_UP      0xBB   // 上行帧头 (ESP32 → ROS2)
+#define COMM_DOWN_LEN        7   // 下行帧字节数
+#define COMM_UP_LEN         15   // 上行帧字节数
+
+// 底盘控制模式 (与下行帧 MODE 字段对应)
+#define MODE_RELEASE        0   // 释放：电机无动力，自由滑行
+#define MODE_MANUAL         1   // 手动遥控：RC 接收机控制 (默认)
+#define MODE_ROS2_AUTO      2   // ROS2 自主导航：速度指令来自 Orin Nano
+#define MODE_ESTOP          3   // 急停：ESP32 本地急停 (不受上位机控制)
+
+// 通信超时保护
+#define COMM_RX_TIMEOUT   200   // 下行帧超时 (ms), 超时自动切回手动模式
+
+// ------------------- [5. 自主"弓"字形清扫核心参数] -------------------
 #define AUTO_LINE_PULSES   8000  // 单行直行距离 (脉冲数)
 #define AUTO_TURN_PULSES   1150  // 原地自旋90度所需单侧脉冲
 #define AUTO_ROW_PULSES    1500  // 换行横向平移距离

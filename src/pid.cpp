@@ -70,3 +70,39 @@ int CascadePID::compute(long target, long actualPos, int actualSpeed,
 
     return out;
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  纯速度环（跳过位置外环，用于 ROS2 自主导航模式）
+//
+//  与 compute() 的内环结构一致，但不经过位置环计算。
+//  速度目标由 Orin Nano serial_bridge 经串口下发。
+// ═══════════════════════════════════════════════════════════════
+int CascadePID::computeVelocity(int vTarget, int actualSpeed,
+                                 float kpV, float feedForward) {
+    // ═══ 速度环（内环）═ 微分先行 (Derivative on Measurement) ═══
+    float v_err = (float)vTarget - (float)actualSpeed;
+
+    // PID 分量
+    //  D 项 = kd_v * (v_last_speed - actualSpeed)
+    //       ≡ -kd_v * d(actualSpeed)/dt  （对实际速度微分，避免目标突跳冲击）
+    float pid_out = kpV * v_err
+                  + ki_v * v_integral
+                  + kd_v * (v_last_speed - actualSpeed);
+    v_last_speed = actualSpeed;
+
+    // 最终输出 = PID 分量 + 重力前馈
+    float out_unsat = pid_out + feedForward;
+    v_saturated = (out_unsat > 255.0f || out_unsat < -255.0f);
+    int out = (int)constrain(out_unsat, -255.0f, 255.0f);
+
+    // ── 条件积分抗饱和 ──
+    if (!v_saturated || (v_err * v_integral < 0.0f)) {
+        v_integral += v_err;
+    }
+    v_integral = constrain(v_integral, -v_imax, v_imax);
+
+    // 纯速度模式下不用位置环饱和标志（保持上次状态不变）
+    // p_saturated 不变，不影响后续切换回 compute() 的行为
+
+    return out;
+}

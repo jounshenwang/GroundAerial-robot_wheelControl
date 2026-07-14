@@ -10,6 +10,7 @@
 #include "imu.h"
 #include "autoclean.h"
 #include "safety.h"
+#include "comm.h"
 
 // ────────────────────────────────────────────────────────────────
 // 全局控制状态 (仅在主控模块内可见)
@@ -37,6 +38,7 @@ void setup() {
     Encoder::begin();           // 编码器中断
     Receiver::begin();          // 遥控接收机中断
     motorBegin();               // 电机引脚 + PWM
+    Comm::commInit();           // UART1 串口通信初始化
 
     // PID 目标与编码器计数对齐
     targetPosL = Encoder::readL();
@@ -56,6 +58,8 @@ void loop() {
     static uint32_t lastPrint = 0;
     if (millis() - lastTick < CONTROL_PERIOD) return;
     lastTick = millis();
+
+    Comm::commUpdate();                 // 与 Orin Nano 交换通信帧 (50Hz)
 
     Safety::feedWatchdog();             // 无条件喂狗 (独立于安全状态)
 
@@ -129,9 +133,11 @@ void loop() {
             float dynMaxV      = maxCPP - slope * (maxCPP * (1.0f - MIN_RPM_FACTOR));
             float dynKpV       = KP_V_FLAT + slope * KP_V_SLOPE;
 
-            // ─── D3. 控制源分流 (手动 / 自动 / 静止) ───
+            // ─── D3. 控制源分流 (手动 / 自主清扫 / ROS2 / 静止) ───
             int moveStep  = 0;
             int steerStep = 0;
+            static uint8_t prevCommMode = MODE_MANUAL;
+            uint8_t curCommMode = Comm::getMode();
 
             bool manual = (abs((int)rxCh2 - 1500) > THROTTLE_DEADBAND ||
                            abs((int)rxCh1 - 1500) > STEERING_DEADBAND);
@@ -154,43 +160,75 @@ void loop() {
                     cntL, cntR);
                 moveStep  = r.moveStep;
                 steerStep = r.steerStep;
+            } else if (curCommMode == MODE_ROS2_AUTO) {
+                // 分支 ④：ROS2 自主导航
+                // 速度指令直接来自 Orin Nano 串口，位置控制由 Nav2 完成
+                autoCleanReset();
+                // 首次进入 ROS2 模式时复位 PID，消除上一模式的残余积分
+                if (prevCommMode != MODE_ROS2_AUTO) {
+                    pidL.reset();
+                    pidR.reset();
+                }
             } else {
                 // 分支 ③：静止驻车
                 autoCleanReset();
             }
 
-            // ─── D4. 位置环目标更新 + 硬限幅 ───
-            targetPosL += (moveStep + steerStep);
-            targetPosR += (moveStep - steerStep);
-            targetPosL = constrain(targetPosL,
-                cntL - ERROR_LIMIT, cntL + ERROR_LIMIT);
-            targetPosR = constrain(targetPosR,
-                cntR - ERROR_LIMIT, cntR + ERROR_LIMIT);
+            // ── D3a. 模式切换过渡处理 ──
+            // 退出 ROS2 模式后需重新对齐位置目标，避免位置环阶跃
+            if (prevCommMode == MODE_ROS2_AUTO && curCommMode != MODE_ROS2_AUTO) {
+                targetPosL = cntL;
+                targetPosR = cntR;
+                pidL.reset();
+                pidR.reset();
+            }
+            prevCommMode = curCommMode;
 
-            // ─── D5. 位置误差超限检测 (带滞回保持) ───
-            // 置位后至少持续 10 个控制周期 (200ms) 才清除，避免瞬态误报
-            static uint8_t posOvrCount = 0;
-            if (abs(targetPosL - cntL) > ERROR_LIMIT * POS_OVERRUN_THRESHOLD ||
-                abs(targetPosR - cntR) > ERROR_LIMIT * POS_OVERRUN_THRESHOLD) {
-                Safety::faultFlags |= FAULT_POS_OVERRUN;
-                posOvrCount = 0;  // 持续超限，保持置位
-            } else if (posOvrCount < 10) {
-                posOvrCount++;    // 等待连续 10 周期正常后才清除
+            // ─── 分流：ROS2 模式走纯速度环，其他模式走位置环+速度环 ───
+            if (curCommMode == MODE_ROS2_AUTO) {
+                // ═══ D4-R. 纯速度环控制 (ROS2 模式) ═══
+                float feedFwd = ((float)pitchPWM - 1500.0f) / 500.0f
+                              * FF_MAP_MAX * ff_fade;
+                int vTargetL = Comm::getTargetVelocityL();
+                int vTargetR = Comm::getTargetVelocityR();
+                vTargetL = constrain(vTargetL, -(int)dynMaxV, (int)dynMaxV);
+                vTargetR = constrain(vTargetR, -(int)dynMaxV, (int)dynMaxV);
+                outL = pidL.computeVelocity(vTargetL, speedL, dynKpV, feedFwd);
+                outR = pidR.computeVelocity(vTargetR, speedR, dynKpV, feedFwd);
             } else {
-                Safety::faultFlags &= ~FAULT_POS_OVERRUN;
+                // ═══ D4. 位置环目标更新 + 硬限幅 ═══
+                targetPosL += (moveStep + steerStep);
+                targetPosR += (moveStep - steerStep);
+                targetPosL = constrain(targetPosL,
+                    cntL - ERROR_LIMIT, cntL + ERROR_LIMIT);
+                targetPosR = constrain(targetPosR,
+                    cntR - ERROR_LIMIT, cntR + ERROR_LIMIT);
+
+                // ═══ D5. 位置误差超限检测 (带滞回保持) ═══
+                // 置位后至少持续 10 个控制周期 (200ms) 才清除，避免瞬态误报
+                static uint8_t posOvrCount = 0;
+                if (abs(targetPosL - cntL) > ERROR_LIMIT * POS_OVERRUN_THRESHOLD ||
+                    abs(targetPosR - cntR) > ERROR_LIMIT * POS_OVERRUN_THRESHOLD) {
+                    Safety::faultFlags |= FAULT_POS_OVERRUN;
+                    posOvrCount = 0;  // 持续超限，保持置位
+                } else if (posOvrCount < 10) {
+                    posOvrCount++;    // 等待连续 10 周期正常后才清除
+                } else {
+                    Safety::faultFlags &= ~FAULT_POS_OVERRUN;
+                }
+
+                // ═══ D6. 串级 PID (位置环 + 速度环) ═══
+                // 浮点映射替代 map() 整数运算，避免阶梯状输出
+                // pitchPWM [1000,2000] → 前馈 [-45,45]，中点 1500 → 0
+                float feedFwd = ((float)pitchPWM - 1500.0f) / 500.0f
+                              * FF_MAP_MAX * ff_fade;
+                outL = pidL.compute(targetPosL, cntL,
+                                        speedL, dynMaxV, dynKpV, feedFwd);
+                outR = pidR.compute(targetPosR, cntR,
+                                        speedR, dynMaxV, dynKpV, feedFwd);
             }
 
-            // ─── D6. 串级 PID ───
-            // 浮点映射替代 map() 整数运算，避免阶梯状输出
-            // pitchPWM [1000,2000] → 前馈 [-45,45]，中点 1500 → 0
-            float feedFwd = ((float)pitchPWM - 1500.0f) / 500.0f
-                          * FF_MAP_MAX * ff_fade;
-            outL = pidL.compute(targetPosL, cntL,
-                                    speedL, dynMaxV, dynKpV, feedFwd);
-            outR = pidR.compute(targetPosR, cntR,
-                                    speedR, dynMaxV, dynKpV, feedFwd);
-
-            // ─── D7. 电机输出 ───
+            // ═══ D7. 电机输出 (两种模式共用) ═══
             motorSetDifferential(outL, outR);
 
         } else {
