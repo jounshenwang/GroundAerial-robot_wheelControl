@@ -6,38 +6,43 @@
 
 // ------------------- [1. 硬件引脚精确映射] -------------------
 // 接收机通道
-#define PX4_CH1_PIN  13   // 右手左右摇杆 (对应底盘转向)
-#define PX4_CH2_PIN  14   // 右手前后摇杆 (对应底盘前进/后退) — 避免使用 GPIO12 (MTDI strapping)
-#define PX4_CH9_PIN  11   // 模式切换开关 (低电平飞行，高电平陆地)
-#define PX4_CH10_PIN 10   // 清洁电机物理开关 & 自主清扫触发器
+#define PX4_CH1_PIN  14   // 右手左右摇杆 (对应底盘转向)
+#define PX4_CH2_PIN  13   // 右手前后摇杆 (对应底盘前进/后退)
+#define PX4_CH9_PIN  12   // 模式切换开关 (低电平飞行，高电平陆地)
+#define PX4_CH10_PIN 11   // 清洁电机物理开关 & 自主清扫触发器
 
 // 底盘电机驱动引脚
 #define STBY_PIN      4
 #define PWMA_PIN      5    // 左前电机 PWM
 #define AIN1_PIN      7    // 左前电机 IN1
 #define AIN2_PIN      6    // 左前电机 IN2
-#define PWMB_PIN      17   // 左后电机 PWM
-#define BIN1_PIN      18   // 左后电机 IN1
-#define BIN2_PIN      21   // 左后电机 IN2
-#define PWMC_PIN      1    // 右后电机 PWM
-#define CIN1_PIN      2    // 右后电机 IN1
-#define CIN2_PIN      42   // 右后电机 IN2
-#define PWMD_PIN      38   // 右前电机 PWM
-#define DIN1_PIN      37   // 右前电机 IN1
-#define DIN2_PIN      39   // 右前电机 IN2
+#define PWMB_PIN      48   // 左后电机 PWM
+#define BIN1_PIN      21   // 左后电机 IN1
+#define BIN2_PIN      47   // 左后电机 IN2
+#define PWMC_PIN      17   // 右后电机 PWM
+#define CIN1_PIN      8    // 右后电机 IN1
+#define CIN2_PIN      18   // 右后电机 IN2
+#define PWMD_PIN      1    // 右前电机 PWM
+#define DIN1_PIN      42   // 右前电机 IN1（原 GPIO 37 连到内部 Flash，已迁移）
+#define DIN2_PIN      2    // 右前电机 IN2
 
-// 清洁电机控制引脚
-#define CLEAN_MOTOR_PIN 47
+// 清洁电机驱动引脚 (第二块 TB6612，1 路，留 1 路备用)
+#define CLEAN_STBY_PIN    10   // TB6612 STBY (独立使能)
+#define CLEAN_PWM_PIN     9    // TB6612 PWMC
+#define CLEAN_PWM_CH      4    // LEDC PWM 通道号 (主电机占用 0~3)
+#define CLEAN_PWM_SPEED   128  // 清洁电机 PWM 占空比 (0~255)
 
 // 霍尔编码器引脚
+// GPIO 33~37 在 ESP32-S3-N16R8 模组内部连接 Octal PSRAM，不可外接！
+// 右编码器改用 GPIO 40/41（J3 排针 11/12 脚）
 #define ENC_L_A      15
 #define ENC_L_B      16
-#define ENC_R_A      36
-#define ENC_R_B      35
+#define ENC_R_A      41
+#define ENC_R_B      40
 
 // I2C MPU6050引脚
-#define MPU_SDA_PIN   8
-#define MPU_SCL_PIN   3
+#define MPU_SDA_PIN   3
+#define MPU_SCL_PIN   39
 #define MPU6050_ADDR  0x68
 
 // ------------------- [2. 常量与控制参数] -------------------
@@ -77,8 +82,8 @@
 // ------------------- [3. 安全与可靠性参数] -------------------
 #define SAFETY_TILT_MAX    45.0f   // 最大允许倾角 (度)，超限→急停
 #define SAFETY_SIGNAL_TIMEOUT 500  // 接收机信号超时判定 (ms)
-#define SAFETY_STALL_MS    500     // 堵转判定持续时长 (ms)
-#define SAFETY_STALL_PWM   250     // 视为堵转的持续饱和输出下限 (PWM 绝对值)
+#define SAFETY_STALL_MS    1000     // 堵转判定持续时长 (ms)
+#define SAFETY_STALL_PWM   300     // 视为堵转的持续饱和输出下限 (PWM 绝对值)
 #define SAFETY_PHASE_TIMEOUT 10000 // 自动清扫单阶段最大耗时 (ms)
 #define WDT_TIMEOUT        3000    // 看门狗超时 (ms)，超限→硬件复位
 

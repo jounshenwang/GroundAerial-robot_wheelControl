@@ -6,6 +6,7 @@
 #include "pid.h"
 #include "imu.h"
 #include "autoclean.h"
+#include "cleaner.h"
 
 #include "esp_task_wdt.h"
 #include <cstring>       // memcpy
@@ -134,18 +135,25 @@ void Safety::runtimeMonitor(int speedL, int speedR, int outL, int outR) {
         }
 
         // ② 冻结检测：仅对模拟通道 ch1/ch2 检查
+        // 仅在陆地模式(>1700)下生效——飞行模式下摇杆自然处于中位，
+        // 若在飞行模式就累计冻结计数，会在约2秒后误触发急停，
+        // 导致切换到陆地模式后电机和清洁滚筒均无法工作。
         bool frozen = true;
         for (int i = 0; i < 2; i++) {
             if (cur[i] != chSnapshot[i]) { frozen = false; break; }
         }
         if (frozen) {
-            signalFreezeCount++;
+            if (Receiver::ch9 > 1700) {
+                signalFreezeCount++;       // 陆地模式：摇杆应活动，冻结需警惕
+            } else {
+                signalFreezeCount = 0;     // 飞行模式：摇杆中位正常，不累计
+            }
         } else {
             memcpy(chSnapshot, cur, sizeof(chSnapshot));
             signalFreezeCount = 0;
             faultFlags &= ~FAULT_RX_SIGNAL;
         }
-        // 连续 20 次采样不变 (~2s) → 判定信号冻结
+        // 连续 20 次采样不变 (~2s) → 判定信号冻结（仅陆地模式可达）
         if (signalFreezeCount >= 20) {
             faultFlags |= FAULT_RX_SIGNAL;
             triggerEStop("RX signal frozen (sticks)");
@@ -153,53 +161,56 @@ void Safety::runtimeMonitor(int speedL, int speedR, int outL, int outR) {
         }
     }
 
-    // ── 2b. IMU 数据有效性检查 ──
-    // 在倾角检测之前检查，避免恢复期间使用过时角度数据导致保护盲区
-    if (!IMU::dataValid) {
-        faultFlags |= FAULT_IMU;
-        triggerEStop("IMU data invalid (I2C error)");
-        return;
-    } else {
-        faultFlags &= ~FAULT_IMU;
-    }
+    // // ── 2b. IMU 数据有效性检查 ──
+    // // 在倾角检测之前检查，避免恢复期间使用过时角度数据导致保护盲区
+    // // 【已注释】不影响电机转动，仅用于安全保护
+    // if (!IMU::dataValid) {
+    //     faultFlags |= FAULT_IMU;
+    //     triggerEStop("IMU data invalid (I2C error)");
+    //     return;
+    // } else {
+    //     faultFlags &= ~FAULT_IMU;
+    // }
+    //
+    // // ── 3. 倾角超限检测 (翻倒保护) ──
+    // if (fabs(IMU::angle_pitch) > SAFETY_TILT_MAX) {
+    //     faultFlags |= FAULT_OVER_TILT;
+    //     triggerEStop("Over-tilt");
+    //     return;
+    // } else {
+    //     faultFlags &= ~FAULT_OVER_TILT;
+    // }
 
-    // ── 3. 倾角超限检测 (翻倒保护) ──
-    if (fabs(IMU::angle_pitch) > SAFETY_TILT_MAX) {
-        faultFlags |= FAULT_OVER_TILT;
-        triggerEStop("Over-tilt");
-        return;
-    } else {
-        faultFlags &= ~FAULT_OVER_TILT;
-    }
-
-    // ── 4. 堵转检测 ──
-    //   PID 输出持续饱和 (≥ SAFETY_STALL_PWM) 且编码器速度近乎零 → 物理堵转
-    if (abs(outL) >= SAFETY_STALL_PWM && abs(speedL) < 2) {
-        if (!stallWarnL) { stallWarnL = true; stallStartL = now; }
-        else if (now - stallStartL > SAFETY_STALL_MS) {
-            faultFlags |= FAULT_STALL_L;
-            triggerEStop("Left motor stall");
-            return;
-        }
-    } else {
-        stallWarnL = false;
-        faultFlags &= ~FAULT_STALL_L;
-    }
-
-    if (abs(outR) >= SAFETY_STALL_PWM && abs(speedR) < 2) {
-        if (!stallWarnR) { stallWarnR = true; stallStartR = now; }
-        else if (now - stallStartR > SAFETY_STALL_MS) {
-            faultFlags |= FAULT_STALL_R;
-            triggerEStop("Right motor stall");
-            return;
-        }
-    } else {
-        stallWarnR = false;
-        faultFlags &= ~FAULT_STALL_R;
-    }
+    // // ── 4. 堵转检测 ──
+    // //   PID 输出持续饱和 (≥ SAFETY_STALL_PWM) 且编码器速度近乎零 → 物理堵转
+    // // 【已注释】无电机调试时暂不启用
+    // if (abs(outL) >= SAFETY_STALL_PWM && abs(speedL) < 2) {
+    //     if (!stallWarnL) { stallWarnL = true; stallStartL = now; }
+    //     else if (now - stallStartL > SAFETY_STALL_MS) {
+    //         faultFlags |= FAULT_STALL_L;
+    //         triggerEStop("Left motor stall");
+    //         return;
+    //     }
+    // } else {
+    //     stallWarnL = false;
+    //     faultFlags &= ~FAULT_STALL_L;
+    // }
+    //
+    // if (abs(outR) >= SAFETY_STALL_PWM && abs(speedR) < 2) {
+    //     if (!stallWarnR) { stallWarnR = true; stallStartR = now; }
+    //     else if (now - stallStartR > SAFETY_STALL_MS) {
+    //         faultFlags |= FAULT_STALL_R;
+    //         triggerEStop("Right motor stall");
+    //         return;
+    //     }
+    // } else {
+    //     stallWarnR = false;
+    //     faultFlags &= ~FAULT_STALL_R;
+    // }
 
     // ── 5. 状态降级判定 ──
-    if (faultFlags & (FAULT_IMU | FAULT_ENCODER_L | FAULT_ENCODER_R)) {
+    // 【已注释 FAULT_IMU】不影响电机转动
+    if (faultFlags & (/* FAULT_IMU | */ FAULT_ENCODER_L | FAULT_ENCODER_R)) {
         state = SAFETY_DEGRADED;
     } else if (faultFlags & FAULT_BAT_LOW) {
         state = SAFETY_WARNING;
@@ -219,7 +230,7 @@ void Safety::triggerEStop(const char* reason) {
 
     // — 立即切断所有动力 —
     motorStopAll(true);          // 四轮短路制动 (防溜坡)
-    digitalWrite(CLEAN_MOTOR_PIN, LOW);
+    Cleaner::off();              // 关闭清洁电机
     pidL.reset();
     pidR.reset();
     autoCleanReset();

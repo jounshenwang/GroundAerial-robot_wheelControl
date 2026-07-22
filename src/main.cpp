@@ -9,6 +9,7 @@
 #include "pid.h"
 #include "imu.h"
 #include "autoclean.h"
+#include "cleaner.h"
 #include "safety.h"
 #include "comm.h"
 
@@ -18,6 +19,7 @@
 static long targetPosL = 0, targetPosR = 0;   // PID 位置目标
 static float ff_fade   = 0;                   // 重力前馈淡入因子 0→1
 static bool lastGround = false;                // 上一周期模式 (用于沿变检测)
+static bool imuOk = false;                     // IMU 初始化成功标志
 
 // ────────────────────────────────────────────────────────────────
 // setup()
@@ -27,18 +29,17 @@ void setup() {
     delay(1000);
     Serial.println("\n======= V12 Modular (4-MOTOR + MPU6050) =======");
 
-    // 清洁电机初始关闭
-    pinMode(CLEAN_MOTOR_PIN, OUTPUT);
-    digitalWrite(CLEAN_MOTOR_PIN, LOW);
+    Cleaner::begin();
 
-    if (!IMU::begin()) {
+    bool imuOk = IMU::begin();
+    if (!imuOk) {
         Serial.println("⚠ MPU6050 初始化失败，FAULT_IMU 置位");
         Safety::faultFlags |= FAULT_IMU;
     }               // MPU6050 初始化
     Encoder::begin();           // 编码器中断
     Receiver::begin();          // 遥控接收机中断
     motorBegin();               // 电机引脚 + PWM
-    Comm::commInit();           // UART1 串口通信初始化
+    // Comm::commInit();           // UART1 串口通信初始化（未连接 Jetson 时注释）
 
     // PID 目标与编码器计数对齐
     targetPosL = Encoder::readL();
@@ -59,7 +60,7 @@ void loop() {
     if (millis() - lastTick < CONTROL_PERIOD) return;
     lastTick = millis();
 
-    Comm::commUpdate();                 // 与 Orin Nano 交换通信帧 (50Hz)
+    // Comm::commUpdate();                 // 与 Orin Nano 交换通信帧 (50Hz，未连接 Jetson 时注释)
 
     Safety::feedWatchdog();             // 无条件喂狗 (独立于安全状态)
 
@@ -68,15 +69,16 @@ void loop() {
     uint32_t rxCh9 = Receiver::ch9, rxCh10 = Receiver::ch10;
 
     // ═══ A. 外设控制 (不受急停影响) ═══
-    // 清洁电机：ch10 > 1600 时开启，但急停状态下不允许开启
-    digitalWrite(CLEAN_MOTOR_PIN,
-        (rxCh10 > 1600 && Safety::state != SAFETY_ESTOP) ? HIGH : LOW);
+    Cleaner::set(rxCh10 > 1600 && Safety::state != SAFETY_ESTOP);
 
     // 姿态更新 (MPU6050 → 互补滤波)
-    IMU::update();
-    // 从俯仰角计算前馈 PWM 值 (1000~2000, 1500=水平)
-    uint32_t pitchPWM = constrain(1500 +
-        (IMU::angle_pitch * PITCH_PWM_GAIN), 1000, 2000);
+    uint32_t pitchPWM = 1500;  // 默认值（水平）
+    if (imuOk) {
+        IMU::update();
+        // 从俯仰角计算前馈 PWM 值 (1000~2000, 1500=水平)
+        pitchPWM = constrain(1500 +
+            (IMU::angle_pitch * PITCH_PWM_GAIN), 1000, 2000);
+    }
 
     // ═══ B. 速度测量 (全模式都需要，放在模式分支前) ═══
     static long lastCntL = 0, lastCntR = 0;
@@ -253,6 +255,14 @@ void loop() {
         Serial.print("[Angle]");   Serial.print(IMU::angle_pitch, 1);
         Serial.print("° [Mode]");  Serial.print(groundMode ? "G" : "F");
         Serial.print(" [Safe]");   Serial.print((int)Safety::state);
+        Serial.print(" [CH]");
+        Serial.print(rxCh1); Serial.print("/");
+        Serial.print(rxCh2); Serial.print("/");
+        Serial.print(rxCh9); Serial.print("/");
+        Serial.print(rxCh10);
+        Serial.print(" [Out]");    Serial.print(outL);
+        Serial.print("/");         Serial.print(outR);
+        Serial.print(" [ff]");     Serial.print(ff_fade, 2);
         Serial.print(" [Auto]");   Serial.print((int)autoState);
         Serial.print(" [Rows]");   Serial.print(rowCount);
         Serial.print("/");         Serial.println(MAX_ROWS);
