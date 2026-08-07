@@ -7,6 +7,7 @@
 #include "imu.h"
 #include "autoclean.h"
 #include "cleaner.h"
+#include "mavlink_bridge.h"
 
 #include "esp_task_wdt.h"
 #include <cstring>       // memcpy

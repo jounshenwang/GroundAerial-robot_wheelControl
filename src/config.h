@@ -115,7 +115,28 @@
 // 通信超时保护
 #define COMM_RX_TIMEOUT   200   // 下行帧超时 (ms), 超时自动切回手动模式
 
-// ------------------- [5. 自主"弓"字形清扫核心参数] -------------------
+// ------------------- [5. MAVLink 飞控通信 (UART2 → Pixhawk TELEM2)] -------------------
+// ESP32 以 Companion Computer 身份通过 MAVLink v2 与飞控通信
+// 启用后急停时自动向飞控发送 disarm 命令锁死无刷电机
+#define MAVLINK_ENABLED
+
+// UART2 引脚: GPIO38=TX → TELEM2 RX(Pin2), GPIO39=RX → TELEM2 TX(Pin3)
+#define MAVLINK_FC_RX_PIN      39
+#define MAVLINK_FC_TX_PIN      38
+#define MAVLINK_FC_BAUD        57600    // PX4 TELEM2 默认波特率
+
+// MAVLink 身份 (Companion Computer)
+#define MAVLINK_SYS_ID         1        // 系统 ID (飞控=1, 此处也填1仅做链路维护; 生产建议 101)
+#define MAVLINK_COMP_ID        192      // MAV_COMP_ID_ONBOARD_COMPUTER2
+
+// 通信周期与超时
+#define MAVLINK_HEARTBEAT_PERIOD  1000  // 上位机 HEARTBEAT 发送间隔 (ms)
+#define MAVLINK_LINK_TIMEOUT      5000  // 飞控心跳超时判定 (ms)
+
+// 安全集成: 急停时自动向飞控发送 disarm (锁死无刷电机)
+#define MAVLINK_DISARM_ON_ESTOP
+
+// ------------------- [6. 自主"弓"字形清扫核心参数] -------------------
 #define AUTO_LINE_PULSES   8000  // 单行直行距离 (脉冲数)
 #define AUTO_TURN_PULSES   1150  // 原地自旋90度所需单侧脉冲
 #define AUTO_ROW_PULSES    1500  // 换行横向平移距离

@@ -1,0 +1,67 @@
+---
+config:
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#ffffff"
+    primaryTextColor: "#000000"
+    primaryBorderColor: "#000000"
+    secondaryColor: "#ffffff"
+    tertiaryColor: "#ffffff"
+    lineColor: "#000000"
+    textColor: "#000000"
+    clusterBkg: "#ffffff"
+    clusterBorder: "#000000"
+    edgeLabelBackground: "#ffffff"
+    titleColor: "#000000"
+    fontFamily: "Microsoft YaHei, sans-serif"
+---
+flowchart LR
+    subgraph EXT["外部系统"]
+        RC["PX4 遥控接收机<br/>CH1 转向 / CH2 油门<br/>CH9 模式 / CH10 清扫开关<br/>(PWM 脉宽 1000~2000µs)"]
+        FC["Pixhawk 飞控 (PX4)<br/>TELEM2 串口"]
+        NANO["Orin Nano (ROS2)<br/>Nav2 + serial_bridge"]
+    end
+
+    subgraph ESP["ESP32-S3 主控 (V12 模块化)"]
+        direction TB
+        RECV["Receiver 模块<br/>PWM 捕获中断"]
+        IMU["IMU 模块<br/>MPU6050 + 互补滤波<br/>俯仰角解算"]
+        ENC["Encoder 模块<br/>霍尔编码器 4 倍频中断"]
+        MAIN["main.cpp 主控循环<br/>50Hz 状态机"]
+        PID["CascadePID 串级控制器<br/>位置环 P+I → 速度环 PID<br/>抗积分饱和 + 重力前馈"]
+        AUTO["Autoclean 模块<br/>'弓'字形清扫状态机"]
+        SAFE["Safety 模块<br/>POST / 看门狗 / 急停<br/>故障检测 / 降级"]
+        MAV["MavlinkBridge 模块<br/>MAVLink v2 自实现<br/>HEARTBEAT + arm/disarm"]
+        COMM["Comm 模块<br/>UART1 二进制帧协议<br/>FSM 解析 + 超时保护"]
+        MOTO["Motor 模块<br/>TB6612 差分驱动"]
+        CLN["Cleaner 模块<br/>清洁电机开关"]
+    end
+
+    subgraph HW["执行器 / 传感器硬件"]
+        M1["TB6612 ×2<br/>4 路底盘电机<br/>(左前/左后/右后/右前)"]
+        M2["清洁电机"]
+        E1["霍尔编码器 ×2<br/>左轮 / 右轮"]
+    end
+
+    RC -- "GPIO 11~14 中断" --> RECV
+    FC -- "UART2 57600<br/>GPIO38/39" --> MAV
+    NANO -- "UART1 921600<br/>GPIO43/44" --> COMM
+
+    RECV --> MAIN
+    IMU <-- "I2C GPIO3/39" --> MAIN
+    ENC --> MAIN
+    COMM --> MAIN
+    MAV --> MAIN
+    AUTO <--> MAIN
+    SAFE <--> MAIN
+    MAIN --> PID
+    PID --> MOTO
+    MAIN --> CLN
+    MOTO --> M1
+    CLN --> M2
+    E1 --> ENC
+
+    SAFE -- "急停 → disarm" --> MAV
+    SAFE -- "急停 → 短路制动" --> MOTO
+    SAFE -- "急停 → 关清洁电机" --> CLN

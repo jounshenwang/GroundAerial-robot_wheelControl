@@ -12,6 +12,7 @@
 #include "cleaner.h"
 #include "safety.h"
 #include "comm.h"
+#include "mavlink_bridge.h"
 
 // ────────────────────────────────────────────────────────────────
 // 全局控制状态 (仅在主控模块内可见)
@@ -39,7 +40,8 @@ void setup() {
     Encoder::begin();           // 编码器中断
     Receiver::begin();          // 遥控接收机中断
     motorBegin();               // 电机引脚 + PWM
-    // Comm::commInit();           // UART1 串口通信初始化（未连接 Jetson 时注释）
+    Comm::commInit();           // UART1 串口通信初始化（未连接 Jetson 时注释）
+    MavlinkBridge::begin();     // UART2 飞控 MAVLink 通信
 
     // PID 目标与编码器计数对齐
     targetPosL = Encoder::readL();
@@ -60,7 +62,8 @@ void loop() {
     if (millis() - lastTick < CONTROL_PERIOD) return;
     lastTick = millis();
 
-    // Comm::commUpdate();                 // 与 Orin Nano 交换通信帧 (50Hz，未连接 Jetson 时注释)
+    Comm::commUpdate();                 // 与 Orin Nano 交换通信帧 (50Hz，未连接 Jetson 时注释)
+    MavlinkBridge::update();            // 飞控 MAVLink 通信 (HEARTBEAT + 命令收发)
 
     Safety::feedWatchdog();             // 无条件喂狗 (独立于安全状态)
 
@@ -123,6 +126,13 @@ void loop() {
                 pidR.reset();
                 ff_fade = 0;
                 autoCleanReset();
+
+                // 进入地面模式 → 锁死飞控无刷电机
+                // (PX4 disarm 后 IO 协处理器继续转发 RC PWM，
+                //   不影响 ESP32 读取遥控信号控制轮子)
+                if (!MavlinkBridge::sendArmDisarm(false)) {
+                    Serial.println("[MAVLink] WARN: FC disarm failed (not connected?)");
+                }
             }
             if (ff_fade < 1.0f) ff_fade += FF_FADE_STEP;
 
@@ -144,15 +154,24 @@ void loop() {
             bool manual = (abs((int)rxCh2 - 1500) > THROTTLE_DEADBAND ||
                            abs((int)rxCh1 - 1500) > STEERING_DEADBAND);
 
-            if (manual && rxCh2 > 900 && rxCh2 < 2100) {
-                // 分支 ①：手动遥控
+            if (curCommMode == MODE_ROS2_AUTO) {
+                // 分支 ①：ROS2 自主导航（最高优先级，不受摇杆影响）
+                // 速度指令直接来自 Orin Nano 串口，位置控制由 Nav2 完成
+                autoCleanReset();
+                // 首次进入 ROS2 模式时复位 PID，消除上一模式的残余积分
+                if (prevCommMode != MODE_ROS2_AUTO) {
+                    pidL.reset();
+                    pidR.reset();
+                }
+            } else if (manual && rxCh2 > 900 && rxCh2 < 2100) {
+                // 分支 ②：手动遥控
                 moveStep  = map((int)rxCh2, 1000, 2000,
                     THROTTLE_STEP_MIN, THROTTLE_STEP_MAX);
                 steerStep = map((int)rxCh1, 1000, 2000,
                     -STEERING_STEP_MIN, -STEERING_STEP_MAX);
                 autoCleanReset();
             } else if (rxCh10 > 1600) {
-                // 分支 ②：自主"弓"字形清扫
+                // 分支 ③：自主"弓"字形清扫
                 if (autoState == CLEAN_IDLE) {
                     rowCount = 0;
                     changeAutoState(LINE_FORWARD,
@@ -162,17 +181,8 @@ void loop() {
                     cntL, cntR);
                 moveStep  = r.moveStep;
                 steerStep = r.steerStep;
-            } else if (curCommMode == MODE_ROS2_AUTO) {
-                // 分支 ④：ROS2 自主导航
-                // 速度指令直接来自 Orin Nano 串口，位置控制由 Nav2 完成
-                autoCleanReset();
-                // 首次进入 ROS2 模式时复位 PID，消除上一模式的残余积分
-                if (prevCommMode != MODE_ROS2_AUTO) {
-                    pidL.reset();
-                    pidR.reset();
-                }
             } else {
-                // 分支 ③：静止驻车
+                // 分支 ④：静止驻车
                 autoCleanReset();
             }
 
@@ -235,6 +245,13 @@ void loop() {
 
         } else {
             // ═══ E. 飞行模式 ═══
+            // 刚从地面切回飞行 → 恢复飞控武装
+            if (lastGround) {
+                if (!MavlinkBridge::sendArmDisarm(true)) {
+                    Serial.println("[MAVLink] WARN: FC arm failed (not connected?)");
+                }
+            }
+
             targetPosL = cntL;
             targetPosR = cntR;
             motorStopAll(false);          // 完全释放

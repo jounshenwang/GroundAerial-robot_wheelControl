@@ -1,0 +1,51 @@
+---
+config:
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#ffffff"
+    primaryTextColor: "#000000"
+    primaryBorderColor: "#000000"
+    secondaryColor: "#ffffff"
+    tertiaryColor: "#ffffff"
+    lineColor: "#000000"
+    textColor: "#000000"
+    clusterBkg: "#ffffff"
+    clusterBorder: "#000000"
+    edgeLabelBackground: "#ffffff"
+    titleColor: "#000000"
+    fontFamily: "Microsoft YaHei, sans-serif"
+---
+flowchart TD
+    subgraph R1["① 周期输入 (50Hz)"]
+        direction LR
+        TICK["20ms 节拍<br/>Comm 帧 / MAVLink / 喂狗"] --> SNAP["快照遥控 ch1/2/9/10"] --> CLN["Cleaner 开关"] --> IMUP["IMU 俯仰 → 重力前馈"] --> SPD["编码器速度"]
+    end
+
+    SPD --> MODE{"ch9>1700<br/>地面?"}
+    MODE -- "否 → 飞行" --> FLY["释放电机 / 飞控 arm<br/>PID 复位"]
+    MODE -- "是 → 地面" --> T1{"刚切地面?"}
+    T1 -- 是 --> T1A["对齐目标 / disarm 飞控"]
+    T1A --> SLOPE
+    T1 -- 否 --> SLOPE["坡度自适应<br/>dynMaxV / dynKpV"]
+
+    SLOPE --> SRC{"控制源"}
+    SRC -- ① --> ROS2["ROS2 自主<br/>(Orin 速度指令)"]
+    SRC -- ② --> MAN["手动摇杆"]
+    SRC -- ③ --> AUTOC["弓字形清扫"]
+    SRC -- ④ --> PARK["静止驻车"]
+
+    MAN --> POS["位置目标 ±步进<br/>±800 限幅"]
+    AUTOC --> POS
+    PARK --> POS
+    POS --> OVR["超限检测<br/>(POS_OVERRUN 告警)"]
+    OVR --> PID["串级 PID + 重力前馈<br/>位置→速度→PWM"]
+    ROS2 --> PID
+
+    PID --> DIFF["motorSetDifferential<br/>差分输出"]
+    DIFF --> MON["runtimeMonitor<br/>安全监控"]
+    FLY --> MON
+    MON --> CHK{"急停?"}
+    CHK -- 否 --> DBG["调试输出 500ms"]
+    CHK -- 是 --> REC{"恢复手势<br/>ch9 低→高"}
+    REC -- 成功 --> DBG

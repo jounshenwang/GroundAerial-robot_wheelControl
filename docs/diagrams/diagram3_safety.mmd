@@ -1,0 +1,39 @@
+---
+config:
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#ffffff"
+    primaryTextColor: "#000000"
+    primaryBorderColor: "#000000"
+    lineColor: "#000000"
+    textColor: "#000000"
+    stateBkg: "#ffffff"
+    stateBorder: "#000000"
+    stateLabelColor: "#000000"
+    noteBkgColor: "#ffffff"
+    noteTextColor: "#000000"
+    titleColor: "#000000"
+    fontFamily: "Microsoft YaHei, sans-serif"
+---
+stateDiagram-v2
+    [*] --> INIT: 上电
+    INIT --> NORMAL: POST 通过<br/>(接收机信号有效 + 看门狗启动)
+    INIT --> ESTOP: POST 失败
+
+    NORMAL --> DEGRADED: 编码器/IMU 故障<br/>(禁用自动清扫 + 前馈归零)
+    NORMAL --> ESTOP: 信号丢失 / 倾角超限(45°)<br/>堵转 / 关键故障
+
+    DEGRADED --> NORMAL: 故障清除
+    DEGRADED --> ESTOP: 升级为关键故障
+
+    ESTOP --> NORMAL: 恢复手势<br/>ch9 飞行→地面 切换一次
+    ESTOP --> ESTOP: 保持制动
+
+    note right of ESTOP
+        触发动作:
+        ① motorStopAll(true) 短路制动防溜坡
+        ② Cleaner::off() 关清洁电机
+        ③ PID/清扫状态机复位
+        ④ MAVLink disarm 飞控 (锁死无刷)
+    end note
