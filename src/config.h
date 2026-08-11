@@ -12,19 +12,22 @@
 #define PX4_CH10_PIN 11   // 清洁电机物理开关 & 自主清扫触发器
 
 // 底盘电机驱动引脚
+// ⚠️ 测试B(诊断): A↔B、C↔D 引脚互换, 判断"B/D 通道不转"是软件通道逻辑问题
+//    还是物理引脚/线问题。判断: 重烧后故障换到 左前+右后 → 软件通道逻辑;
+//    故障仍在 左后+右前 → 物理引脚/线。测完请改回原值。
 #define STBY_PIN      4
-#define PWMA_PIN      5    // 左前电机 PWM
-#define AIN1_PIN      7    // 左前电机 IN1
-#define AIN2_PIN      6    // 左前电机 IN2
-#define PWMB_PIN      48   // 左后电机 PWM
-#define BIN1_PIN      21   // 左后电机 IN1
-#define BIN2_PIN      47   // 左后电机 IN2
-#define PWMC_PIN      17   // 右后电机 PWM
-#define CIN1_PIN      8    // 右后电机 IN1
-#define CIN2_PIN      18   // 右后电机 IN2
-#define PWMD_PIN      1    // 右前电机 PWM
-#define DIN1_PIN      42   // 右前电机 IN1（原 GPIO 37 连到内部 Flash，已迁移）
-#define DIN2_PIN      2    // 右前电机 IN2
+#define PWMA_PIN      48   // 左前电机 PWM (测试B: 原48)
+#define AIN1_PIN      21   // 左前电机 IN1 (测试B: 原21)
+#define AIN2_PIN      47   // 左前电机 IN2 (测试B: 原47)
+#define PWMB_PIN      5    // 左后电机 PWM (测试B: 原5)
+#define BIN1_PIN      7    // 左后电机 IN1 (测试B: 原7)
+#define BIN2_PIN      6    // 左后电机 IN2 (测试B: 原6)
+#define PWMC_PIN      1    // 右后电机 PWM (测试B: 原1)
+#define CIN1_PIN      42   // 右后电机 IN1 (测试B: 原42)
+#define CIN2_PIN      2    // 右后电机 IN2 (测试B: 原2)
+#define PWMD_PIN      17   // 右前电机 PWM (测试B: 原17)
+#define DIN1_PIN      8    // 右前电机 IN1 (测试B: 原8, 原 GPIO 37 连到内部 Flash 已迁移)
+#define DIN2_PIN      18   // 右前电机 IN2 (测试B: 原18)
 
 // 清洁电机驱动引脚 (第二块 TB6612，1 路，留 1 路备用)
 #define CLEAN_STBY_PIN    10   // TB6612 STBY (独立使能)

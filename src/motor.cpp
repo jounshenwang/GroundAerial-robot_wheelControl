@@ -20,14 +20,10 @@ void motorBegin() {
     pinMode(DIN1_PIN, OUTPUT); pinMode(DIN2_PIN, OUTPUT);
 
     // LEDC PWM 配置 (5kHz, 8bit)
-    // ⚠️ 测试A(诊断): LEDC 通道 0↔1、2↔3 互换。
-    //    目的: 区分"B/D 通道不转"是 LEDC 通道 1/3 的问题, 还是 GPIO 引脚的问题。
-    //    判断: 重烧后故障换到 A/C → LEDC 通道坏; 故障还在 B/D → 引脚问题。
-    //    测完请改回 0,1,2,3。
-    ledcSetup(1, 5000, 8); ledcAttachPin(PWMA_PIN, 1);   // A → LEDC 1
-    ledcSetup(0, 5000, 8); ledcAttachPin(PWMB_PIN, 0);   // B → LEDC 0
-    ledcSetup(3, 5000, 8); ledcAttachPin(PWMC_PIN, 3);   // C → LEDC 3
-    ledcSetup(2, 5000, 8); ledcAttachPin(PWMD_PIN, 2);   // D → LEDC 2
+    ledcSetup(0, 5000, 8); ledcAttachPin(PWMA_PIN, 0);
+    ledcSetup(1, 5000, 8); ledcAttachPin(PWMB_PIN, 1);
+    ledcSetup(2, 5000, 8); ledcAttachPin(PWMC_PIN, 2);
+    ledcSetup(3, 5000, 8); ledcAttachPin(PWMD_PIN, 3);
 }
 
 void motorSet(int out, int p1, int p2, int channel) {
@@ -47,11 +43,10 @@ void motorSet(int out, int p1, int p2, int channel) {
 }
 
 void motorSetDifferential(int left, int right) {
-    // ⚠️ 测试A(诊断): LEDC 通道 0↔1、2↔3 互换, 与 motorBegin 保持一致
-    motorSet(left,  AIN1_PIN, AIN2_PIN, 1);  // 左前 → LEDC 1
-    motorSet(left,  BIN1_PIN, BIN2_PIN, 0);  // 左后 → LEDC 0
-    motorSet(right, DIN1_PIN, DIN2_PIN, 2);  // 右前 → LEDC 2
-    motorSet(right, CIN1_PIN, CIN2_PIN, 3);  // 右后 → LEDC 3
+    motorSet(left,  AIN1_PIN, AIN2_PIN, 0);  // 左前
+    motorSet(left,  BIN1_PIN, BIN2_PIN, 1);  // 左后
+    motorSet(right, DIN1_PIN, DIN2_PIN, 3);  // 右前
+    motorSet(right, CIN1_PIN, CIN2_PIN, 2);  // 右后
 }
 
 void motorStopAll(bool activeBrake) {
