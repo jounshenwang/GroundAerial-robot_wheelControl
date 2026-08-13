@@ -83,10 +83,13 @@
 #define FF_MAP_MAX    45     // 前馈 PWM 最大值 (极限后仰)
 
 // 手动控制速度映射
-#define THROTTLE_STEP_MIN  -50  // 油门最小步进
-#define THROTTLE_STEP_MAX   50  // 油门最大步进
-#define STEERING_STEP_MIN  -25  // 转向最小步进
-#define STEERING_STEP_MAX   25  // 转向最大步进
+// 2026-08-13: 满杆轮速 50 → 120 计数/20ms (电机能力 maxCPP≈147, 达 82%)。
+// 原值 50 仅 34%, 用户反馈"太慢"。跟踪滞后=步进/kp_p≈170 计数, 远小于
+// ERROR_LIMIT 800。若地面负载使电机达不到 120, 位置限幅会自动降速(调速器作用)。
+#define THROTTLE_STEP_MIN  -120  // 油门最小步进
+#define THROTTLE_STEP_MAX   120  // 油门最大步进
+#define STEERING_STEP_MIN   -60  // 转向最小步进 (原比例 转向/油门=0.5 同步放大)
+#define STEERING_STEP_MAX    60  // 转向最大步进
 
 // 位置误差告警阈值 (占 ERROR_LIMIT 比例)
 #define POS_OVERRUN_THRESHOLD 0.85f
