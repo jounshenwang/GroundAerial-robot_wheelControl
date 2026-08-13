@@ -8,17 +8,20 @@
 /// 集成抗积分饱和 (Anti-Windup) 机制：条件积分法
 struct CascadePID {
     // ---------- 位置环参数 (P + I) ----------
-    float kp_p       = 1.2;
-    float ki_p       = 0.01;
+    // 增益在 config.h 统一定义, 保证 boot banner 打印与实际一致
+    float kp_p       = KP_P_POS;
+    float ki_p       = KI_P_POS;
     float p_integral = 0;
     float p_imax     = 50;      ///< 位置环积分上限 (对称)
 
     // ---------- 速度环参数 (PID) ----------
-    float kp_v       = 8.5;
-    float ki_v       = 1.2;
-    float kd_v       = 0.5;
+    // kp_v 运行期被 dynKpV (KP_V_FLAT + slope*KP_V_SLOPE) 覆盖, 此处仅默认值
+    float kp_v       = KP_V_FLAT;
+    float ki_v       = KI_V_SPD;
+    float kd_v       = KD_V_SPD;
     float v_integral = 0;
-    float v_imax     = 100;     ///< 速度环积分上限 (对称, = I_V_LIMIT)
+    // 累加器钳位: I 输出 = ki_v * v_integral, 取上限使 I 输出权限 = ±I_V_LIMIT
+    float v_imax     = (I_V_LIMIT / KI_V_SPD);
     int v_last_speed = 0;       ///< 上一周期实际速度 (微分先行, int 防截断)
 
     // ---------- 抗积分饱和状态 (调试用) ----------

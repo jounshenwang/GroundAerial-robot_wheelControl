@@ -12,22 +12,19 @@
 #define PX4_CH10_PIN 11   // 清洁电机物理开关 & 自主清扫触发器
 
 // 底盘电机驱动引脚
-// ⚠️ 测试B(诊断): A↔B、C↔D 引脚互换, 判断"B/D 通道不转"是软件通道逻辑问题
-//    还是物理引脚/线问题。判断: 重烧后故障换到 左前+右后 → 软件通道逻辑;
-//    故障仍在 左后+右前 → 物理引脚/线。测完请改回原值。
 #define STBY_PIN      4
-#define PWMA_PIN      48   // 左前电机 PWM (测试B: 原48)
-#define AIN1_PIN      21   // 左前电机 IN1 (测试B: 原21)
-#define AIN2_PIN      47   // 左前电机 IN2 (测试B: 原47)
-#define PWMB_PIN      5    // 左后电机 PWM (测试B: 原5)
-#define BIN1_PIN      7    // 左后电机 IN1 (测试B: 原7)
-#define BIN2_PIN      6    // 左后电机 IN2 (测试B: 原6)
-#define PWMC_PIN      1    // 右后电机 PWM (测试B: 原1)
-#define CIN1_PIN      42   // 右后电机 IN1 (测试B: 原42)
-#define CIN2_PIN      2    // 右后电机 IN2 (测试B: 原2)
-#define PWMD_PIN      17   // 右前电机 PWM (测试B: 原17)
-#define DIN1_PIN      8    // 右前电机 IN1 (测试B: 原8, 原 GPIO 37 连到内部 Flash 已迁移)
-#define DIN2_PIN      18   // 右前电机 IN2 (测试B: 原18)
+#define PWMA_PIN      5    // 左前电机 PWM
+#define AIN1_PIN      7    // 左前电机 IN1
+#define AIN2_PIN      6    // 左前电机 IN2
+#define PWMB_PIN      48   // 左后电机 PWM
+#define BIN1_PIN      21   // 左后电机 IN1
+#define BIN2_PIN      47   // 左后电机 IN2
+#define PWMC_PIN      17   // 右后电机 PWM
+#define CIN1_PIN      8    // 右后电机 IN1
+#define CIN2_PIN      18   // 右后电机 IN2
+#define PWMD_PIN      1    // 右前电机 PWM
+#define DIN1_PIN      42   // 右前电机 IN1（原 GPIO 37 连到内部 Flash，已迁移）
+#define DIN2_PIN      2    // 右前电机 IN2
 
 // 清洁电机驱动引脚 (第二块 TB6612，1 路，留 1 路备用)
 #define CLEAN_STBY_PIN    10   // TB6612 STBY (独立使能)
@@ -65,9 +62,21 @@
 #define STEERING_DEADBAND  50   // 转向通道死区 (±µs 相对于 1500)
 
 // PID 参数
-#define KP_V_FLAT    8.5f   // 速度环比例增益 (平地)
-#define KP_V_SLOPE   4.0f   // 速度环比例增益坡道增量 (陡坡时附加)
+// 速度环增益量纲: PWM / (计数每20ms)。满速约147计数/20ms → 满PWM 255,
+// 故 kp_v 取 ~1.7 满量程线性。旧值 8.5 在速度误差>30 即饱和 → bang-bang 震荡。
+// 2026-08-13 二次修正: kpV 2.0→1.2, ki_v 1.2→0.1, kp_p 1.2→0.7。
+// 实测 ki_v=1.2 时积分每周期 +1.2*误差, 2~3 周期即冲到 ±100 上限,
+// 即使 kpV 已降, I 项仍把输出顶到饱和 → 持续 bang-bang 极限环。
+#define KP_V_FLAT    1.2f   // 速度环比例增益 (平地)
+#define KP_V_SLOPE   0.6f   // 速度环比例增益坡道增量 (陡坡时附加)
 #define MIN_RPM_FACTOR 0.46666667f  // 陡坡保留最小速比
+
+// 串级 PID 其余增益 (位置环外环 + 速度环积分/微分)
+// 速度单位: 计数/20ms (满速≈147); PWM 单位: -255~255
+#define KP_P_POS  0.7f   // 位置环比例: 位置误差→速度目标。1.2 与速度环耦合振荡, 降为 0.7
+#define KI_P_POS  0.01f  // 位置环积分
+#define KI_V_SPD  0.1f   // 速度环积分: 慢速消稳态误差。过快→积分驱动极限环
+#define KD_V_SPD  0.5f   // 速度环微分: 对实际速度微分 (阻尼)
 
 // 前馈映射范围
 #define FF_MAP_MIN   -45     // 前馈 PWM 最小值 (极限前倾)
@@ -81,6 +90,11 @@
 
 // 位置误差告警阈值 (占 ERROR_LIMIT 比例)
 #define POS_OVERRUN_THRESHOLD 0.85f
+
+// 反馈失控检测 (防跑飞安全网): 位置误差大 且 轮子朝误差反方向滚
+#define RUN_AWAY_ERR    500   // 位置误差阈值 (计数), 需 < ERROR_LIMIT
+#define RUN_AWAY_SPD    5     // 轮速阈值 (计数/20ms), 约 250 counts/s 以上才算滚动
+#define RUN_AWAY_CYCLES 50    // 持续判定周期数 (50×20ms = 1s) 后触发急停
 
 // ------------------- [3. 安全与可靠性参数] -------------------
 #define SAFETY_TILT_MAX    45.0f   // 最大允许倾角 (度)，超限→急停

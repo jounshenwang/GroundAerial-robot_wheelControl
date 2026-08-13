@@ -29,9 +29,18 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n======= V12 Modular (4-MOTOR + MPU6050) =======");
+    // 增益版本标识: 烧录后从串口首行确认固件与 PID 参数是否最新
+    Serial.print("PID gains -> kpP:"); Serial.print(KP_P_POS);
+    Serial.print(" kpV:");            Serial.print(KP_V_FLAT);
+    Serial.print(" kiV:");            Serial.print(KI_V_SPD);
+    Serial.print(" kdV:");            Serial.print(KD_V_SPD);
+    Serial.println("  <- v2026-08-13");
 
     Cleaner::begin();
 
+    // ⚠️ 注意：此处故意声明局部变量遮蔽全局 static imuOk，
+    // 因为当前未连接 MPU6050，重力前馈逻辑已注释。接回 MPU 时
+    // 去掉 "bool" 改为 imuOk = IMU::begin(); 即可恢复。
     bool imuOk = IMU::begin();
     if (!imuOk) {
         Serial.println("⚠ MPU6050 初始化失败，FAULT_IMU 置位");
@@ -243,6 +252,27 @@ void loop() {
             // ═══ D7. 电机输出 (两种模式共用) ═══
             motorSetDifferential(outL, outR);
 
+            // ═══ D8. 反馈失控检测 (安全网) ═══
+            // 编码器反馈方向接反/断线时: 位置误差持续大 且 轮子按计数看
+            // 在朝误差反方向滚动 → 正反馈全速跑飞。持续 RUN_AWAY_CYCLES
+            // 周期 (1s) 后急停制动, 避免"推杆一次就满功率冲出去"。
+            static uint8_t runawayCount = 0;
+            long errL = targetPosL - cntL;
+            long errR = targetPosR - cntR;
+            bool runaway =
+                (errL >  RUN_AWAY_ERR && speedL < -RUN_AWAY_SPD) ||
+                (errL < -RUN_AWAY_ERR && speedL >  RUN_AWAY_SPD) ||
+                (errR >  RUN_AWAY_ERR && speedR < -RUN_AWAY_SPD) ||
+                (errR < -RUN_AWAY_ERR && speedR >  RUN_AWAY_SPD);
+            if (runaway) {
+                if (++runawayCount >= RUN_AWAY_CYCLES) {
+                    Safety::triggerEStop("feedback runaway");
+                    runawayCount = 0;
+                }
+            } else {
+                runawayCount = 0;
+            }
+
         } else {
             // ═══ E. 飞行模式 ═══
             // 刚从地面切回飞行 → 恢复飞控武装
@@ -279,6 +309,13 @@ void loop() {
         Serial.print(rxCh10);
         Serial.print(" [Out]");    Serial.print(outL);
         Serial.print("/");         Serial.print(outR);
+        Serial.print(" [Cnt]");    Serial.print(cntL);
+        Serial.print("/");         Serial.print(cntR);
+        Serial.print(" [Tgt]");    Serial.print(targetPosL);
+        Serial.print("/");         Serial.print(targetPosR);
+        Serial.print(" [Spd]");    Serial.print(speedL);
+        Serial.print("/");         Serial.print(speedR);
+        Serial.print(" [Mode2]");  Serial.print((int)Comm::getMode());
         Serial.print(" [ff]");     Serial.print(ff_fade, 2);
         Serial.print(" [Auto]");   Serial.print((int)autoState);
         Serial.print(" [Rows]");   Serial.print(rowCount);
